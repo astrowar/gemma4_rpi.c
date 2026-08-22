@@ -12,6 +12,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <cpuid.h>
+#include <omp.h>
+
 #define NUM_LAYERS 35
 #define HIDDEN_SIZE 1536
 #define VOCAB_SIZE 262144
@@ -221,6 +224,15 @@ Model *load_model(const char *path, size_t *file_size) {
 // ----------------------------------------------------------------------------
 // Scalar kernels
 
+static inline int thread_count(void) {
+    unsigned int eax, ebx, ecx, edx;
+    __cpuid_count(0xB, 0, eax, ebx, ecx, edx);
+    int logical_cpus = omp_get_num_procs();
+    int threads_per_core = ebx & 0xffff;
+    return getenv("OMP_NUM_THREADS") ? omp_get_max_threads()
+                                     : logical_cpus / (threads_per_core ? threads_per_core : 1);
+}
+
 float fp16_to_float(uint16_t value) {
     int sign = value >> 15;
     int exponent = (value >> 10) & 31;
@@ -254,6 +266,7 @@ float weight_scale(const Tensor *weight, int output, int input_group) {
 }
 
 void quantize(int8_t *output, float *scales, const float *input, size_t rows, int width) {
+    #pragma omp for schedule(static)
     for (size_t group = 0; group < rows * (size_t)(width / 64); group++) {
         float max_abs = 0.0f;
         for (int k = 0; k < 64; k++) {
@@ -274,6 +287,7 @@ void matmul_int8(float *output, const int8_t *input, const float *input_scales,
     int outputs = weight->shape[0];
     int inputs = weight->shape[1];
     int groups = inputs / 64;
+    #pragma omp for collapse(2) schedule(static)
     for (size_t row = 0; row < rows; row++) {
         for (int j = 0; j < outputs; j++) {
             float sum = 0.0f;
@@ -296,6 +310,7 @@ void embedding(float *output, const Tensor *table, const int *tokens,
                size_t token_count, float multiplier) {
     int width = table->shape[1];
     int groups = width / 64;
+    #pragma omp for schedule(static)
     for (size_t token_index = 0; token_index < token_count; token_index++) {
         int block = tokens[token_index] / 16;
         int row = tokens[token_index] % 16;
@@ -317,6 +332,7 @@ void embedding(float *output, const Tensor *table, const int *tokens,
 void rmsnorm(float *output, const float *input, const Tensor *weight,
              int width, float epsilon, size_t rows) {
     const float *weights = weight ? (const float *)weight->data : NULL;
+    #pragma omp for schedule(static)
     for (size_t row = 0; row < rows; row++) {
         const float *input_row = input + row * width;
         float *output_row = output + row * width;
@@ -330,12 +346,14 @@ void rmsnorm(float *output, const float *input, const Tensor *weight,
 }
 
 void add_and_scale(float *output, const float *addend, size_t count, float scale) {
+    #pragma omp for schedule(static)
     for (size_t i = 0; i < count; i++) output[i] = (output[i] + addend[i]) * scale;
 }
 
 void apply_rope(const Tensor *cosines, const Tensor *sines, float *vectors,
                 int num_heads, int head_dim, int start_pos, size_t token_count) {
     int pairs = cosines->shape[1];
+    #pragma omp for schedule(static)
     for (size_t token = 0; token < token_count; token++) {
         const float *cosine = (float *)cosines->data + (start_pos + token) * pairs;
         const float *sine = (float *)sines->data + (start_pos + token) * pairs;
@@ -366,6 +384,7 @@ void geglu(float *gate, const float *up, int rows, int width, int up_stride,
     float lower = (float)gelu_table->shape[1];
     float upper = (float)gelu_table->shape[2];
     float scale = (float)(table_size - 1) / (upper - lower);
+    #pragma omp for collapse(2) schedule(static)
     for (int row = 0; row < rows; row++) {
         for (int i = 0; i < width; i++) {
             float x = gate[row * width + i];
@@ -444,6 +463,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
     }
 
     int num_heads = query_width / head_dim;
+    #pragma omp for collapse(2) schedule(dynamic, 1)
     for (int head = 0; head < num_heads; head++) {
         for (size_t token = 0; token < token_count; token++) {
             int position = start_pos + (int)token;
@@ -470,6 +490,8 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
 void forward(Model *model, InferenceState *state, const int *tokens,
              size_t token_count, int start_pos) {
     int per_layer_width = model->weights.per_layer_projection_norm.shape[0];
+    #pragma omp parallel num_threads(thread_count())
+    {
     float scores[(size_t)start_pos + token_count];
 
     embedding(state->residual, &model->weights.embed, tokens, token_count,
@@ -531,16 +553,21 @@ void forward(Model *model, InferenceState *state, const int *tokens,
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE,
                       ((float *)weights->layer_scalar.data)[0]);
     }
+    }
 }
 
 float *logits(Model *model, InferenceState *state, size_t token) {
+    #pragma omp parallel num_threads(thread_count())
+    {
     rmsnorm(state->hidden, state->residual + token * HIDDEN_SIZE,
             &model->weights.norm, HIDDEN_SIZE, 1e-6f, 1);
     quantize(state->quantized, state->activation_scales, state->hidden, 1, HIDDEN_SIZE);
     matmul_int8(state->hidden, state->quantized, state->activation_scales,
                 &model->weights.embed, 1);
+    #pragma omp for schedule(static)
     for (int i = 0; i < VOCAB_SIZE; i++) {
         state->hidden[i] = 30.0f * tanhf(state->hidden[i] / 30.0f);
+    }
     }
     return state->hidden;
 }
