@@ -10,10 +10,10 @@ An educational project made to understand how LLM inference works. The full infe
 
 Measured on an AMD Ryzen 7 7700 using the default native build.
 
-| Implementation | Prefill (pp512) | Decode (tg128) |
-| -------------- | --------------: | -------------: |
-| gemma4.c (int8) | 638.86 ± 2.93 tok/s | 25.90 ± 0.01 tok/s |
-| llama.cpp (Q8_0) | 276.32 ± 1.85 tok/s | 23.83 ± 0.01 tok/s |
+| Implementation | Prefill (pp512) | Decode (tg128@d512) |
+| -------------- | --------------: | ------------------: |
+| gemma4.c (int8) | 632.84 ± 6.07 tok/s | 25.01 ± 0.07 tok/s |
+| llama.cpp (Q8_0) | 262.16 ± 1.19 tok/s | 23.19 ± 0.03 tok/s |
 
 Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup, with each runtime using its fastest tested thread count. Both were built natively for CPU and dynamically quantize matrix inputs to int8.
 
