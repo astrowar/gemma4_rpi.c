@@ -1,5 +1,8 @@
 /gemma4-E2B-int8.bin
 /run
 /run.exe
+/test_neon_matmul
+/test_kernels_pure
 /.venv
 /__pycache__/
+/.cache/
