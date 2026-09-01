@@ -12,6 +12,15 @@ static float fp16_to_f32(uint16_t value) {
     return sign ? -result : result;
 }
 
+// Dispatches a linear layer to the kernel matching the model's weight format.
+// Activations are always dynamically int8-quantized; only the stored weights
+// differ between int8 and int4.
+static inline void matmul_dispatch(Model *model, float *output, const int8_t *input_q,
+                                   const float *input_scales, const Tensor *weight, size_t rows) {
+    if (model->quant == QUANT_INT4) matmul_int4(output, input_q, input_scales, weight, rows);
+    else matmul_int8(output, input_q, input_scales, weight, rows);
+}
+
 // Looks up packed int8 embedding rows and dequantizes them directly without materializing the full embedding table.
 void embedding(float *output, const Tensor *table, const int *tokens, size_t token_count, float multiplier) {
     const int block_rows = 16;
@@ -86,7 +95,7 @@ void softmax(float *values, int count) {
 }
 
 // Builds queries, updates the KV cache, and computes causal attention over 512 tokens or the full context while shared layers reuse the latest compatible cache.
-void attention(InferenceState *state, const LayerWeights *layers, int layer,
+void attention(Model *model, InferenceState *state, const LayerWeights *layers, int layer,
                int start_pos, size_t token_count, float *scores) {
     const LayerWeights *weights = &layers[layer];
     int full_attention = layer % 5 == 4; // Every fifth layer uses full attention.
@@ -100,15 +109,15 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
     float *value_cache = key_cache + (size_t)cache_len * head_dim;
 
     quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->q_proj.shape[1]);
-    matmul_int8(state->auxiliary, state->quantized, state->activation_scales, &weights->q_proj, token_count);
+    matmul_dispatch(model, state->auxiliary, state->quantized, state->activation_scales, &weights->q_proj, token_count);
     rmsnorm(state->auxiliary, state->auxiliary, &weights->q_norm, head_dim, 1e-6f, token_count * (query_width / head_dim));
     apply_rope(&weights->rope_cos, &weights->rope_sin, state->auxiliary, query_width / head_dim, head_dim, start_pos, token_count);
 
     if (weights->k_proj.data) {
         float *new_keys = key_cache + ((size_t)start_pos & cache_mask) * head_dim;
         float *new_values = value_cache + ((size_t)start_pos & cache_mask) * head_dim;
-        matmul_int8(new_keys, state->quantized, state->activation_scales, &weights->k_proj, token_count);
-        matmul_int8(new_values, state->quantized, state->activation_scales, &weights->v_proj, token_count);
+        matmul_dispatch(model, new_keys, state->quantized, state->activation_scales, &weights->k_proj, token_count);
+        matmul_dispatch(model, new_values, state->quantized, state->activation_scales, &weights->v_proj, token_count);
         rmsnorm(new_keys, new_keys, &weights->k_norm, head_dim, 1e-6f, token_count);
         rmsnorm(new_values, new_values, NULL, head_dim, 1e-6f, token_count); // Value vectors are normalized without a learned weight.
         apply_rope(&weights->rope_cos, &weights->rope_sin, new_keys, 1, head_dim, start_pos, token_count);
@@ -128,7 +137,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
     }
 
     quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->o_proj.shape[1]);
-    matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->o_proj, token_count);
+    matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->o_proj, token_count);
 }
 
 void forward(Model *model, InferenceState *state, const int *tokens, size_t token_count, int start_pos) {
@@ -141,7 +150,7 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
 
     // Build the token-conditioned input that each transformer layer will receive.
     quantize(state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE);
-    matmul_int8(state->per_layer_inputs, state->quantized, state->activation_scales, &model->weights.per_layer_model_projection, token_count);
+    matmul_dispatch(model, state->per_layer_inputs, state->quantized, state->activation_scales, &model->weights.per_layer_model_projection, token_count);
     rmsnorm(state->per_layer_inputs, state->per_layer_inputs, &model->weights.per_layer_projection_norm, per_layer_width, 1e-6f * HIDDEN_SIZE, token_count * NUM_LAYERS);
 
     embedding(state->hidden, &model->weights.embed_per_layer, tokens, token_count, sqrtf((float)per_layer_width));
@@ -152,25 +161,25 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
         LayerWeights *weights = &model->weights.layers[layer];
 
         rmsnorm(state->hidden, state->residual, &weights->input_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
-        attention(state, model->weights.layers, layer, start_pos, token_count, scores);
+        attention(model, state, model->weights.layers, layer, start_pos, token_count, scores);
         rmsnorm(state->hidden, state->hidden, &weights->post_attn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE, 1.0f);
 
         rmsnorm(state->hidden, state->residual, &weights->pre_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
         quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->gate_proj.shape[1]);
-        matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->gate_proj, token_count);
-        matmul_int8(state->auxiliary, state->quantized, state->activation_scales, &weights->up_proj, token_count);
+        matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->gate_proj, token_count);
+        matmul_dispatch(model, state->auxiliary, state->quantized, state->activation_scales, &weights->up_proj, token_count);
         geglu(state->hidden, state->auxiliary, token_count, weights->gate_proj.shape[0], weights->gate_proj.shape[0], &model->weights.gelu_table);
         quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->down_proj.shape[1]);
-        matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->down_proj, token_count);
+        matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->down_proj, token_count);
         rmsnorm(state->hidden, state->hidden, &weights->post_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE, 1.0f);
         // Gate and project this layer's conditioning input before adding it to the residual stream with a learned scale.
         quantize(state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE);
-        matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->per_layer_input_gate, token_count);
+        matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->per_layer_input_gate, token_count);
         geglu(state->hidden, state->per_layer_inputs + layer * per_layer_width, token_count, per_layer_width, NUM_LAYERS * per_layer_width, &model->weights.gelu_table);
         quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->per_layer_projection.shape[1]);
-        matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->per_layer_projection, token_count);
+        matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->per_layer_projection, token_count);
         rmsnorm(state->hidden, state->hidden, &weights->post_per_layer_input_norm, HIDDEN_SIZE, 1e-6f, token_count);
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE,
                    ((float *)weights->layer_scalar.data)[0]);
@@ -184,7 +193,7 @@ float *logits(Model *model, InferenceState *state, size_t token) {
     {
         rmsnorm(state->hidden, state->residual + token * HIDDEN_SIZE, &model->weights.norm, HIDDEN_SIZE, 1e-6f, 1);
         quantize(state->quantized, state->activation_scales, state->hidden, 1, HIDDEN_SIZE);
-        matmul_int8(state->hidden, state->quantized, state->activation_scales, &model->weights.embed, 1);
+        matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &model->weights.embed, 1);
         #pragma omp for schedule(static)
         for (int i = 0; i < VOCAB_SIZE; i++) state->hidden[i] = 30.0f * tanhf(state->hidden[i] / 30.0f);
     }

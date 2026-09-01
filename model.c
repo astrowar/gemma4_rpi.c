@@ -16,6 +16,14 @@ Model *model_load(const char *path) {
         return NULL;
     }
 
+    // Old int8 files predate the quant field and read back as 0; treat that as int8.
+    if (model->quant == 0) model->quant = QUANT_INT8;
+    if (model->quant != QUANT_INT8 && model->quant != QUANT_INT4) {
+        fprintf(stderr, "unsupported quantization mode %d\n", (int)model->quant);
+        munmap(model, (size_t)st.st_size);
+        return NULL;
+    }
+
     Tensor *tensors = (Tensor *)&model->weights;
     for (size_t i = 0; i < sizeof(model->weights) / sizeof(*tensors); i++) {
         tensors[i].data = tensors[i].data ? (void *)((uint8_t *)model + (uintptr_t)tensors[i].data) : NULL;

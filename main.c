@@ -36,12 +36,21 @@ int main(int argc, char **argv) {
     if (model == MAP_FAILED) { perror("mmap"); return 1; }
 
     if (memcmp(model->magic, "MOG", 4) != 0) { fprintf(stderr, "bad model file\n"); return 1; }
+    // Old int8 files predate the quant field and read back as 0; treat that as int8.
+    if (model->quant == 0) model->quant = QUANT_INT8;
+    if (model->quant != QUANT_INT8 && model->quant != QUANT_INT4) {
+        fprintf(stderr, "unsupported quantization mode %d\n", (int)model->quant);
+        munmap(model, (size_t)st.st_size);
+        return 1;
+    }
     Tensor *tensors = (Tensor *)&model->weights;
     for (size_t i = 0; i < sizeof(model->weights) / sizeof(*tensors); i++) {
         tensors[i].data = tensors[i].data ? (void *)((uint8_t *)model + (uintptr_t)tensors[i].data) : NULL;
         tensors[i].scales = tensors[i].scales ? (uint16_t *)((uint8_t *)model + (uintptr_t)tensors[i].scales) : NULL;
     }
-    fprintf(stderr, "Model loaded: %.1f MB\n", (double)st.st_size / (1024.0 * 1024.0));
+    fprintf(stderr, "Model loaded: %.1f MB (%s weights)\n",
+            (double)st.st_size / (1024.0 * 1024.0),
+            model->quant == QUANT_INT4 ? "int4" : "int8");
     InferenceState *state = calloc(1, sizeof(*state));
 
     seed_rng();

@@ -48,7 +48,7 @@ def read_json(root, name):
         return json.load(file)
 
 
-def tensor(weights, path, synthetic=None):
+def tensor(weights, path, synthetic=None, quant_mode=8):
     global cursor
     shape = tuple(synthetic.shape) if synthetic is not None else tuple(
         int(n) for n in weights.get_slice(path).get_shape()
@@ -56,17 +56,26 @@ def tensor(weights, path, synthetic=None):
     if not 1 <= len(shape) <= 2 or any(size <= 0 for size in shape):
         raise ValueError(f"unsupported shape for {path}: {shape}")
     quantized = synthetic is None and len(shape) == 2
-    if quantized and (shape[0] % BLOCK_ROWS or shape[1] % GROUP_SIZE):
+    group = 64 if quant_mode == 8 else 32
+    if quantized and (shape[0] % BLOCK_ROWS or shape[1] % group):
         raise ValueError(f"cannot pack {path} with shape {shape}")
     count = math.prod(shape)
     result = {
         "path": path, "shape": shape, "synthetic": synthetic,
-        "data": cursor, "scales": 0,
+        "data": cursor, "scales": 0, "quant_mode": quant_mode,
     }
-    cursor = align64(cursor + count * (1 if quantized else 4))
-    if quantized:
-        result["scales"] = cursor
-        cursor = align64(cursor + count // GROUP_SIZE * 2)
+    if quant_mode == 8:
+        cursor = align64(cursor + count * (1 if quantized else 4))
+        if quantized:
+            result["scales"] = cursor
+            cursor = align64(cursor + count // group * 2)
+    elif quant_mode == 4:
+        cursor = align64(cursor + count * (0.5 if quantized else 4))
+        if quantized:
+            result["scales"] = cursor
+            cursor = align64(cursor + count // group * 2)
+    else:
+        raise ValueError(f"unsupported quant mode {quant_mode}")
     return result
 
 
@@ -92,7 +101,7 @@ def rope_tables(config):
     return *sliding, *global_
 
 
-def text_tensors(weights, config):
+def text_tensors(weights, config, quant_mode=8):
     tables = rope_tables(config)
     rope_cache = {}
 
@@ -102,8 +111,8 @@ def text_tensors(weights, config):
         return rope_cache[index]
 
     slots = [
-        tensor(weights, "model.language_model.embed_tokens.weight"),
-        tensor(weights, "model.language_model.embed_tokens_per_layer.weight"),
+        tensor(weights, "model.language_model.embed_tokens.weight", quant_mode=quant_mode),
+        tensor(weights, "model.language_model.embed_tokens_per_layer.weight", quant_mode=quant_mode),
     ]
     for layer in range(N_LAYERS):
         p = f"model.language_model.layers.{layer}."
@@ -115,17 +124,17 @@ def text_tensors(weights, config):
             tensor(weights, p + "post_attention_layernorm.weight"),
             tensor(weights, p + "post_feedforward_layernorm.weight"),
             tensor(weights, p + "post_per_layer_input_norm.weight"),
-            tensor(weights, p + "per_layer_input_gate.weight"),
-            tensor(weights, p + "per_layer_projection.weight"),
+            tensor(weights, p + "per_layer_input_gate.weight", quant_mode=quant_mode),
+            tensor(weights, p + "per_layer_projection.weight", quant_mode=quant_mode),
             tensor(weights, p + "self_attn.q_norm.weight"),
             tensor(weights, p + "self_attn.k_norm.weight") if shared_kv else None,
-            tensor(weights, p + "self_attn.q_proj.weight"),
-            tensor(weights, p + "self_attn.k_proj.weight") if shared_kv else None,
-            tensor(weights, p + "self_attn.v_proj.weight") if shared_kv else None,
-            tensor(weights, p + "self_attn.o_proj.weight"),
-            tensor(weights, p + "mlp.gate_proj.weight"),
-            tensor(weights, p + "mlp.up_proj.weight"),
-            tensor(weights, p + "mlp.down_proj.weight"),
+            tensor(weights, p + "self_attn.q_proj.weight", quant_mode=quant_mode),
+            tensor(weights, p + "self_attn.k_proj.weight", quant_mode=quant_mode) if shared_kv else None,
+            tensor(weights, p + "self_attn.v_proj.weight", quant_mode=quant_mode) if shared_kv else None,
+            tensor(weights, p + "self_attn.o_proj.weight", quant_mode=quant_mode),
+            tensor(weights, p + "mlp.gate_proj.weight", quant_mode=quant_mode),
+            tensor(weights, p + "mlp.up_proj.weight", quant_mode=quant_mode),
+            tensor(weights, p + "mlp.down_proj.weight", quant_mode=quant_mode),
             shared_rope(rope_index), shared_rope(rope_index + 1),
         ]
         intermediate_size = 6144 if layer < N_KV_LAYERS else 12288
@@ -143,7 +152,7 @@ def text_tensors(weights, config):
     gelu["shape"] = (GELU_TABLE_N, int(GELU_TABLE_LO), int(GELU_TABLE_HI))
     slots += [
         tensor(weights, "model.language_model.norm.weight"),
-        tensor(weights, "model.language_model.per_layer_model_projection.weight"),
+        tensor(weights, "model.language_model.per_layer_model_projection.weight", quant_mode=quant_mode),
         tensor(weights, "model.language_model.per_layer_projection_norm.weight"),
         gelu,
     ]
@@ -264,12 +273,19 @@ def tensor_record(tensor):
     return TENSOR_RECORD.pack(tensor["data"], tensor["scales"], *shape)
 
 
-def quantize(array):
-    groups = array.reshape(-1, GROUP_SIZE)
+def quantize(array, quant_mode=8):
+    group = 64 if quant_mode == 8 else 32
+    groups = array.reshape(-1, group)
     # Round the scale to its fp16 storage precision first, then quantize against the rounded value so the runtime dequantizes with the exact scale used here. Floor at the smallest normal fp16.
-    scales = np.maximum(np.abs(groups).max(axis=1) / 127.0, 6.104e-05).astype("<f2")
+    if quant_mode == 8:
+        scales = np.maximum(np.abs(groups).max(axis=1) / 127.0, 6.104e-05).astype("<f2")
+        wide = scales.astype("<f4")
+        values = np.rint(groups / wide[:, None]).clip(-127, 127).astype(np.int8)
+        return values, scales
+    # int4: symmetric range [-8, 7] (zero point 8), scale = max_abs / 8.
+    scales = np.maximum(np.abs(groups).max(axis=1) / 8.0, 6.104e-05).astype("<f2")
     wide = scales.astype("<f4")
-    values = np.rint(groups / wide[:, None]).clip(-127, 127).astype(np.int8)
+    values = np.rint(groups / wide[:, None]).clip(-8, 7).astype(np.int8)
     return values, scales
 
 
@@ -301,28 +317,43 @@ def write_tensor(output, weights, tensor, progress):
             progress.update(array.size)
             continue
 
-        values, scales = quantize(array)
+        values, scales = quantize(array, tensor["quant_mode"])
         rows, columns = array.shape
-        blocks, groups = rows // BLOCK_ROWS, columns // GROUP_SIZE
-        values = values.reshape(rows, columns).reshape(
-            blocks, BLOCK_ROWS, groups, GROUP_SIZE // BLOCK_WIDTH, BLOCK_WIDTH
-        ).transpose(0, 2, 3, 1, 4).reshape(-1)
+        blocks, groups = rows // BLOCK_ROWS, columns // (64 if tensor["quant_mode"] == 8 else 32)
+        if tensor["quant_mode"] == 8:
+            values = values.reshape(rows, columns).reshape(
+                blocks, BLOCK_ROWS, groups, GROUP_SIZE // BLOCK_WIDTH, BLOCK_WIDTH
+            ).transpose(0, 2, 3, 1, 4).reshape(-1)
+            packed = values.tobytes()
+        else:
+            # int4: pack two 4-bit values per byte. Each row's group is 32
+            # values -> 16 bytes; low nibble = even input, high = odd.
+            # Layout: [block][group][row][16 bytes] -> group stride is
+            # BLOCK_ROWS*16 (16 rows x 16 bytes), matching the runtime kernels.
+            packed_values = values.reshape(rows, columns).reshape(
+                blocks, BLOCK_ROWS, groups, 16, 2
+            ).transpose(0, 2, 1, 3, 4)
+            low = (packed_values[..., 0::2] + 8).astype(np.uint8)
+            high = (packed_values[..., 1::2] + 8).astype(np.uint8)
+            packed = (low | (high << 4)).reshape(-1).tobytes()
         scales = scales.reshape(blocks, BLOCK_ROWS, groups).transpose(0, 2, 1).reshape(-1)
         output.seek(data_at)
-        output.write(values.tobytes())
-        data_at += values.nbytes
+        output.write(packed)
+        data_at += len(packed)
         output.seek(scales_at)
         output.write(scales.tobytes())
         scales_at += scales.nbytes
         progress.update(array.size)
 
 
-def export(checkpoint_path, output_path):
+def export(checkpoint_path, output_path, quant_mode=8):
     global cursor
+    if quant_mode not in (8, 4):
+        raise ValueError(f"unsupported quant mode {quant_mode}")
     checkpoint_path = checkpoint_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print("Loading checkpoint...")
+    print(f"Loading checkpoint (exporting {quant_mode}-bit weights)...")
     model = read_json(checkpoint_path, "config.json")
     tokenizer = compile_tokenizer(read_json(checkpoint_path, "tokenizer.json"))
     text_config = validate_text_config(model)
@@ -332,7 +363,7 @@ def export(checkpoint_path, output_path):
         raise FileNotFoundError("checkpoint is missing model.safetensors")
     cursor = align64(HEADER_SIZE + TOKENIZER_SPAN + TEXT_TENSOR_SPAN)
     with safetensors.safe_open(weights_path, framework="pt") as weights:
-        text = text_tensors(weights, text_config)
+        text = text_tensors(weights, text_config, quant_mode)
         file_size = cursor
 
         with tempfile.TemporaryDirectory(
@@ -342,6 +373,7 @@ def export(checkpoint_path, output_path):
                 temporary_path = Path(output.name)
                 output.truncate(file_size)
                 output.write(b"MOG\0")
+                output.write(struct.pack("<i", quant_mode))
                 output.write(tokenizer)
                 for item in text:
                     record = tensor_record(item) if item else bytes(TENSOR_RECORD.size)
@@ -371,8 +403,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("-o", "--out", type=Path, required=True)
+    parser.add_argument("--quant", choices=("int8", "int4"), default="int8",
+                        help="weight quantization mode (default: int8)")
     args = parser.parse_args()
-    export(args.checkpoint, args.out)
+    export(args.checkpoint, args.out, 4 if args.quant == "int4" else 8)
 
 
 if __name__ == "__main__":

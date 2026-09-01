@@ -59,6 +59,14 @@ typedef struct {
 // ----------------------------------------------------------------------------
 // Model types
 
+// Weight quantization mode, recorded in the model header so the runtime can
+// select the matching kernels. int8 is the original format; int4 packs two
+// 4-bit weights per byte with a scale every 32 inputs to halve memory traffic.
+typedef enum {
+    QUANT_INT8 = 8,
+    QUANT_INT4 = 4,
+} QuantMode;
+
 // data and scales begin as file offsets and become pointers after the model is memory-mapped.
 typedef struct {
     void *data;
@@ -112,12 +120,13 @@ typedef struct {
 
 typedef struct {
     char magic[4];
+    QuantMode quant; // Weight quantization mode (QUANT_INT8 or QUANT_INT4); 0 in old files.
     Tokenizer tokenizer;
     ModelWeights weights;
 } Model;
 
 // Verifies that the compiler laid out the memory-mapped model exactly as the exporter expects.
-_Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && sizeof(VocabEntry) == 100 && offsetof(VocabEntry, id) == 96 && sizeof(LookupEntry) == 16 && sizeof(Tokenizer) == 33429932 && sizeof(Tensor) == 32 && sizeof(ModelWeights) == 21472 && sizeof(Model) == 33451408 && offsetof(Model, weights) == 33429936 && BATCH_SIZE == SLIDING_WINDOW && !((SLIDING_WINDOW + BATCH_SIZE) & (SLIDING_WINDOW + BATCH_SIZE - 1)) && !(MAX_CONTEXT & (MAX_CONTEXT - 1)), "MOG ABI mismatch");
+_Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && sizeof(VocabEntry) == 100 && offsetof(VocabEntry, id) == 96 && sizeof(LookupEntry) == 16 && sizeof(Tokenizer) == 33429932 && sizeof(Tensor) == 32 && sizeof(ModelWeights) == 21472 && sizeof(Model) == 33451416 && offsetof(Model, quant) == 4 && offsetof(Model, tokenizer) == 8 && offsetof(Model, weights) == 33429944 && BATCH_SIZE == SLIDING_WINDOW && !((SLIDING_WINDOW + BATCH_SIZE) & (SLIDING_WINDOW + BATCH_SIZE - 1)) && !(MAX_CONTEXT & (MAX_CONTEXT - 1)), "MOG ABI mismatch");
 
 // ----------------------------------------------------------------------------
 // Shared helpers
@@ -151,6 +160,10 @@ void model_unload(Model *model, size_t size);
 // kernels.c
 
 void matmul_int8(float *output, const int8_t *input_q, const float *input_scales,
+                 const Tensor *weight, size_t rows);
+// int4 weights (two 4-bit values per byte, one fp16 scale per 32 inputs) against
+// dynamically int8-quantized activations. Same signature as matmul_int8.
+void matmul_int4(float *output, const int8_t *input_q, const float *input_scales,
                  const Tensor *weight, size_t rows);
 void quantize(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width);
 void attention_scores(float *scores, const float *query, const float *key_cache,

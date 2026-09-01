@@ -51,11 +51,23 @@ test-neon:
 	$(CC) $(CFLAGS_BASE) -mcpu=cortex-a72 -O2 test_neon_matmul.c kernels_neon.c -o test_neon_matmul $(LDFLAGS)
 	./test_neon_matmul
 
+# Correctness test: int4 matmul vs float reference.
+# test-int4-pure builds the scalar reference; test-int4-neon builds the NEON kernel.
+test-int4-pure:
+	$(CC) $(CFLAGS_BASE) -O2 test_int4.c kernels_pure.c -o test_int4_pure $(LDFLAGS)
+	./test_int4_pure
+
+test-int4-neon:
+	$(CC) $(CFLAGS_BASE) -mcpu=cortex-a72 -O2 test_int4.c kernels_neon.c -o test_int4_neon $(LDFLAGS)
+	./test_int4_neon
+
 # Run all available tests.
 test:
 	@echo "Running tests..."
+	$(MAKE) test-int4-pure
 	@if [ "$(ARCH)" = "neon" ]; then \
 		$(MAKE) test-neon; \
+		$(MAKE) test-int4-neon; \
 	fi
 
 info:
