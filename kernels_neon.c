@@ -650,6 +650,44 @@ void quantize(int8_t *quantized, float *scales, const float *input, size_t rows,
     }
 }
 
+// int4 variant: quantize activations in groups of 32 to match the int4 weight scale granularity.
+void quantize_int4(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width) {
+    #pragma omp for schedule(static)
+    for (size_t group_index = 0; group_index < rows * (width / 32); group_index++) {
+        const float *group = input + group_index * 32;
+
+        // NEON: find max absolute value (4-wide).
+        float32x4_t m0 = vdupq_n_f32(0.0f);
+        float32x4_t m1 = vdupq_n_f32(0.0f);
+        float32x4_t m2 = vdupq_n_f32(0.0f);
+        float32x4_t m3 = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 32; j += 16) {
+            m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(group + j + 0)));
+            m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(group + j + 4)));
+            m2 = vmaxq_f32(m2, vabsq_f32(vld1q_f32(group + j + 8)));
+            m3 = vmaxq_f32(m3, vabsq_f32(vld1q_f32(group + j + 12)));
+        }
+        float32x4_t m = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
+        float max_abs = vmaxvq_f32(m);
+
+        float scale = max_abs / 127.0f;
+        float inverse_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        // NEON: multiply, round to int32, narrow to int8 (8 at a time).
+        for (int j = 0; j < 32; j += 8) {
+            float32x4_t v0 = vmulq_n_f32(vld1q_f32(group + j), inverse_scale);
+            float32x4_t v1 = vmulq_n_f32(vld1q_f32(group + j + 4), inverse_scale);
+            int32x4_t q0 = vcvtnq_s32_f32(v0);
+            int32x4_t q1 = vcvtnq_s32_f32(v1);
+            int16x4_t q016 = vqmovn_s32(q0);
+            int16x4_t q116 = vqmovn_s32(q1);
+            int8x8_t q8 = vqmovn_s16(vcombine_s16(q016, q116));
+            vst1_s8(quantized + group_index * 32 + j, q8);
+        }
+        scales[group_index] = scale;
+    }
+}
+
 void attention_scores(float *scores, const float *query, const float *key_cache,
         int first_key, int num_keys, int cache_mask, int head_dim) {
     for (int key_index = 0; key_index < num_keys; key_index++) {

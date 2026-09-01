@@ -26,7 +26,7 @@ GROUP_SIZE = 64
 BLOCK_ROWS = 16
 BLOCK_WIDTH = 4
 
-TOKENIZER_SPAN = 33_429_932
+TOKENIZER_SPAN = 33_429_936  # 4-byte quant field + 33_429_932-byte Tokenizer
 # data, scales, shape[4] — matches C Tensor (32 bytes)
 TENSOR_RECORD = struct.Struct("<QQ4i")
 LOOKUP_RECORD = struct.Struct("<8sii")
@@ -70,7 +70,8 @@ def tensor(weights, path, synthetic=None, quant_mode=8):
             result["scales"] = cursor
             cursor = align64(cursor + count // group * 2)
     elif quant_mode == 4:
-        cursor = align64(cursor + count * (0.5 if quantized else 4))
+        # int4: 2 weights per byte -> count // 2 bytes for quantized tensors.
+        cursor = align64(cursor + (count // 2 if quantized else count * 4))
         if quantized:
             result["scales"] = cursor
             cursor = align64(cursor + count // group * 2)

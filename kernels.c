@@ -147,6 +147,23 @@ void quantize(int8_t *quantized, float *scales, const float *input, size_t rows,
     }
 }
 
+// int4 variant: quantize activations in groups of 32 to match the int4 weight scale granularity.
+void quantize_int4(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width) {
+    #pragma omp for schedule(static)
+    for (size_t group_index = 0; group_index < rows * (width / 32); group_index++) {
+        const float *group = input + group_index * 32;
+        float max_abs = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float value = fabsf(group[j]);
+            if (value > max_abs) max_abs = value;
+        }
+        float scale = max_abs / 127.0f;
+        float inverse_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        for (int j = 0; j < 32; j++) quantized[group_index * 32 + j] = (int8_t)rintf(group[j] * inverse_scale);
+        scales[group_index] = scale;
+    }
+}
+
 void attention_scores(float *scores, const float *query, const float *key_cache,
         int first_key, int num_keys, int cache_mask, int head_dim) {
     for (int key_index = 0; key_index < num_keys; key_index++) {

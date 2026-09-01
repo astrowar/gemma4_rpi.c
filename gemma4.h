@@ -166,6 +166,8 @@ void matmul_int8(float *output, const int8_t *input_q, const float *input_scales
 void matmul_int4(float *output, const int8_t *input_q, const float *input_scales,
                  const Tensor *weight, size_t rows);
 void quantize(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width);
+// int4 variant: quantize activations in groups of 32 to match the int4 weight scale granularity.
+void quantize_int4(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width);
 void attention_scores(float *scores, const float *query, const float *key_cache,
                       int first_key, int num_keys, int cache_mask, int head_dim);
 void weighted_value_sum(float *output, const float *probabilities, const float *value_cache,

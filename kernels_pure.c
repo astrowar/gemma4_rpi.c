@@ -74,6 +74,24 @@ void quantize(int8_t *output, float *scales, const float *input, size_t rows, si
     }
 }
 
+// int4 variant: quantize activations in groups of 32 to match the int4 weight scale granularity.
+void quantize_int4(int8_t *output, float *scales, const float *input, size_t rows, size_t width) {
+    #pragma omp for schedule(static)
+    for (size_t group = 0; group < rows * (width / 32); group++) {
+        float max_abs = 0.0f;
+        for (int k = 0; k < 32; k++) {
+            float value = fabsf(input[group * 32 + k]);
+            if (value > max_abs) max_abs = value;
+        }
+        float scale = max_abs / 127.0f;
+        float inverse_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        for (int k = 0; k < 32; k++) {
+            output[group * 32 + k] = (int8_t)rintf(input[group * 32 + k] * inverse_scale);
+        }
+        scales[group] = scale;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // int8 matrix multiply
 
