@@ -12,7 +12,7 @@ ifeq ($(KERNELS),pure)
   CFLAGS = $(CFLAGS_BASE)
   ARCH = pure
 else ifeq ($(KERNELS),avx2)
-  KERNEL_SRC = kernels.c
+  KERNEL_SRC = kernels.c kernels_avx_int4.c
   CFLAGS = $(CFLAGS_BASE) -mavx2 -mfma
   ARCH = avx2
 else ifeq ($(KERNELS),neon)
@@ -20,7 +20,7 @@ else ifeq ($(KERNELS),neon)
   CFLAGS = $(CFLAGS_BASE) -mcpu=cortex-a72
   ARCH = neon
 else ifneq ($(HAS_AVX2),0)
-  KERNEL_SRC = kernels.c
+  KERNEL_SRC = kernels.c kernels_avx_int4.c
   CFLAGS = $(CFLAGS_BASE) -march=native
   ARCH = native
 else ifneq ($(IS_AARCH64),0)
@@ -61,6 +61,10 @@ test-int4-neon:
 	$(CC) $(CFLAGS_BASE) -mcpu=cortex-a72 -O2 test_int4.c kernels_neon.c -o test_int4_neon $(LDFLAGS)
 	./test_int4_neon
 
+test-int4-avx:
+	$(CC) $(CFLAGS_BASE) -mavx2 -mfma -O2 test_int4.c kernels_avx_int4.c -o test_int4_avx $(LDFLAGS)
+	./test_int4_avx
+
 # Run all available tests.
 test:
 	@echo "Running tests..."
@@ -68,6 +72,9 @@ test:
 	@if [ "$(ARCH)" = "neon" ]; then \
 		$(MAKE) test-neon; \
 		$(MAKE) test-int4-neon; \
+	fi
+	@if [ "$(ARCH)" = "avx2" ] || [ "$(ARCH)" = "native" ]; then \
+		$(MAKE) test-int4-avx; \
 	fi
 
 info:
@@ -82,4 +89,4 @@ profile:
 	./run_profile $(ARGS)
 
 clean:
-	rm -f run run.exe run_profile test_neon_matmul test_kernels_pure
+	rm -f run run.exe run_profile test_neon_matmul test_kernels_pure test_int4_pure test_int4_neon test_int4_avx

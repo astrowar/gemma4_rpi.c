@@ -84,51 +84,7 @@ void matmul_int8(float *output, const int8_t *input_q, const float *input_scales
         matmul_block(output, input_q, input_scales, weight, rows, output_block);
 }
 
-// int4 weights against int8 activations. The AVX2 path does not yet have a
-// SIMD int4 kernel, so this uses the portable scalar reference (same layout
-// and math as kernels_pure.c). Correct but slower than the NEON int4 path.
-static inline float fp16_to_f32_k(const uint16_t value) {
-    int sign = value >> 15;
-    int exponent = (value >> 10) & 31;
-    int fraction = value & 1023;
-    float result;
-    if (exponent == 0) result = ldexpf((float)fraction, -24);
-    else if (exponent == 31) result = fraction ? NAN : INFINITY;
-    else result = ldexpf((float)(1024 + fraction), exponent - 25);
-    return sign ? -result : result;
-}
-
-void matmul_int4(float *output, const int8_t *input, const float *input_scales,
-                 const Tensor *weight, size_t rows) {
-    const int block_rows = 16;
-    int outputs = weight->shape[0];
-    int inputs = weight->shape[1];
-    int groups = inputs / 32;
-    const uint8_t *data = (const uint8_t *)weight->data;
-    #pragma omp for collapse(2) schedule(static)
-    for (size_t row = 0; row < rows; row++) {
-        for (int j = 0; j < outputs; j++) {
-            int block = j / block_rows;
-            int r = j % block_rows;
-            float sum = 0.0f;
-            for (int group = 0; group < groups; group++) {
-                int dot = 0;
-                // Block stride is 16 rows x (inputs/2) bytes (int4 packs 2/byte).
-                const uint8_t *wg = data + (size_t)block * block_rows * (inputs / 2)
-                                    + (size_t)group * block_rows * 16 + r * 16;
-                for (int k = 0; k < 32; k++) {
-                    int input_index = group * 32 + k;
-                    uint8_t packed = wg[k / 2];
-                    int nibble = (packed >> ((k % 2) * 4)) & 0xf;
-                    dot += (int)input[row * inputs + input_index] * (nibble - 8);
-                }
-                float scale = fp16_to_f32_k(weight->scales[((size_t)block * groups + group) * 16 + r]);
-                sum += (float)dot * input_scales[row * groups + group] * scale;
-            }
-            output[row * outputs + j] = sum;
-        }
-    }
-}
+// matmul_int4 lives in kernels_avx_int4.c (AVX2/AVX-512 SIMD implementation).
 
 // Converts each input row to int8 in groups of 64 values with a float scale recording each group's magnitude.
 void quantize(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width) {
