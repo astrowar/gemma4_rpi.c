@@ -1,8 +1,8 @@
 # gemma4.c
 
-Gemma 4 E2B CPU inference in 700 lines of pure C.
+Gemma 4 E2B CPU inference in pure C.
 
-An educational project made to understand how LLM inference works. The full inference path is implemented in one file without external libraries.
+An educational project made to understand how LLM inference works. The full inference path is implemented without external libraries. Matrix weights can be stored as int8 (group of 64) or int4 (group of 32, two 4-bit values per byte); inputs to linear layers are dynamically quantized to int8 in either case.
 
 <img width="800" height="339" alt="demo" src="https://github.com/user-attachments/assets/2de47c35-ee34-473e-9164-635c82377267" />
 
@@ -23,15 +23,17 @@ Results are the mean ± sample standard deviation over 12 timed runs after one d
 
 ## Quick start
 
-You need a CPU with AVX2, an OpenMP-capable C compiler, and `make`. The model takes about 5.0 GB of disk space, and 8 GB of RAM is recommended.
+You need an OpenMP-capable C compiler and `make`. On x86, AVX2 is required for the SIMD kernels (otherwise the build falls back to portable scalar code). The int8 model takes about 5.0 GB (4.7 GiB) of disk space and the int4 model about 2.7 GB (2.6 GiB); 8 GB of RAM is recommended.
 
-Clone the repository and download the ready-to-run model:
+Clone the repository and download a ready-to-run model:
 
 ```bash
 git clone https://github.com/ryanssenn/gemma4.c
 cd gemma4.c
 python3 -m pip install -U huggingface_hub
 hf download QmogAI/gemma4-e2b-int8 gemma4-E2B-int8.bin --local-dir .
+# or the smaller int4 variant:
+hf download QmogAI/gemma4-e2b-int4 gemma4-E2B-int4.bin --local-dir .
 ```
 
 On Linux:
@@ -39,6 +41,8 @@ On Linux:
 ```bash
 make
 ./run -t 0 -n 256 "Why is the sky blue?"
+# to use the int4 model:
+./run -m ./gemma4-E2B-int4.bin -t 0 -n 256 "Why is the sky blue?"
 ```
 
 On Windows, use a MinGW-w64 environment that provides `gcc`, OpenMP, and `make`:
@@ -47,6 +51,16 @@ On Windows, use a MinGW-w64 environment that provides `gcc`, OpenMP, and `make`:
 make win64 WINCC=gcc
 .\run.exe -t 0 -n 256 "Why is the sky blue?"
 ```
+
+### Kernel selection
+
+The `Makefile` picks the kernel implementation automatically: AVX2/AVX-512 on x86, NEON on aarch64, and portable scalar code elsewhere. You can override it with `KERNELS=pure`, `KERNELS=avx2`, or `KERNELS=neon`. See `make info` to print the resolved configuration.
+
+| Kernels | Files | Weights |
+| ------- | ----- | ------- |
+| `avx2` / `native` | `kernels.c` (int8) + `kernels_avx_int4.c` (int4) | int8, int4 |
+| `neon` | `kernels_neon.c` | int8, int4 |
+| `pure` | `kernels_pure.c` | int8, int4 |
 
 ## Options
 
@@ -60,13 +74,20 @@ make win64 WINCC=gcc
 
 The C runtime cannot read the original checkpoint directly. `exporter.py` takes the tokenizer and language-model weights from the Hugging Face checkpoint and writes them in the exact layout used by `gemma4.c`.
 
-Matrix weights are stored as int8 with FP16 scales. Inputs to linear layers are dynamically quantized to int8 while the rest of the activations remain float32. The resulting file is about 5.0 GB (4.7 GiB).
+Matrix weights are stored with FP16 scales in one of two modes:
 
-To create it yourself instead:
+- **int8** (default): one int8 per weight, one scale per group of 64 inputs. The resulting file is about 5.0 GB (4.7 GiB).
+- **int4**: two 4-bit values per byte (zero point 8, range [−8, +7]), one scale per group of 32 inputs. The resulting file is about 2.7 GB (2.6 GiB).
+
+In both modes, inputs to linear layers are dynamically quantized to int8 (in groups of 64 for int8, 32 for int4) while the rest of the activations remain float32.
+
+To create a model file yourself:
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized -o ./gemma4-E2B-int8.bin
+# or the int4 variant:
+python3 exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized --quant int4 -o ./gemma4-E2B-int4.bin
 ```
 
 Python is only needed to export the model or run numerical validation. Once the `.bin` file exists, inference runs entirely through the C program.
@@ -102,7 +123,16 @@ python3 validation.py 64
 
 ## Repository contents
 
-- `gemma4.c` contains the tokenizer, model definitions, kernels, transformer, KV cache, and generation loop.
+- `gemma4.h` — shared types, constants, and cross-module declarations.
+- `tokenizer.c` — BPE encode/decode.
+- `model.c` — model loading, memory mapping, tensor offset resolution.
+- `kernels.c` — AVX2/AVX-512 int8 matmul, quantize, attention, GELU.
+- `kernels_avx_int4.c` — AVX2 int4 matmul (linked with `kernels.c` on x86).
+- `kernels_neon.c` — ARM NEON int8 and int4 kernels (aarch64).
+- `kernels_pure.c` — portable scalar fallback for all kernels.
+- `transformer.c` — forward pass: embedding, layernorms, attention, MLP, logits.
+- `generate.c` — sampling, prefill, generation loop, benchmark.
+- `main.c` — CLI argument parsing, model loading, entry point.
 - `exporter.py` converts the original checkpoint into the binary layout read by the C runtime.
 - `validation.py` compares the runtime's logits with Hugging Face Transformers.
 - `validation.txt` contains the WikiText-103 passage used for numerical validation.

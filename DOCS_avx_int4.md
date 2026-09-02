@@ -76,7 +76,7 @@ unrepresentable value on the unsigned side where `0x80` is read as 128.
 
 - **rows == 1** (decode): `matmul_int4_block_1x16` — one input row, 16 outputs.
 - **rows >= 2** (prefill): `matmul_int4_block_2x16` — pairs of input rows
-  share weight loads; odd trailing row is handled with `has_row1 == 0`.
+  share weight loads; an odd trailing row is handled with `has1 == 0`.
 
 Both use `#pragma omp for` over output blocks (16 rows each).
 

@@ -352,6 +352,55 @@ Para ganhos maiores no decode, seria necessário:
 
 ---
 
+## 10b. Kernel int4 (grupo 32)
+
+Além do int8, o `kernels_neon.c` implementa `matmul_int4` para o formato
+int4 (dois valores de 4 bits por byte, zero point 8, um scale fp16 por grupo
+de 32 entradas). O layout dos pesos é:
+
+```
+data[block*16*(width/2) + group*16*16 + row*16 + byte]
+scales[(block*groups + group)*16 + row]
+```
+
+Cada byte guarda duas entradas (nibble baixo = entrada par, nibble alto =
+entrada ímpar). Uma linha de 16 bytes cobre um grupo inteiro de 32 entradas.
+
+### Widening: `int4_row_to_s8`
+
+Os 32 valores int4 de uma linha são ampliados para `int8x16` (nibble − 8) e
+acumulados com o mesmo mecanismo `vmull_s8`/`vpadalq_s16` do caminho int8 —
+o produto escalar inteiro é exato; só o passo de rescale muda (scale a cada
+32 entradas em vez de 64):
+
+```c
+int8x16_t int4_row_to_s8(const uint8_t *row) {
+    uint8x16_t packed = vld1q_u8(row);
+    uint8x16_t low  = vandq_u8(packed, vdupq_n_u8(0x0f));
+    uint8x16_t high = vrshlq_u8(packed, vdupq_n_u8(4));
+    int8x16_t lo8 = vreinterpretq_s8_u8(vsubq_u8(low,  vdupq_n_u8(8)));
+    int8x16_t hi8 = vreinterpretq_s8_u8(vsubq_u8(high, vdupq_n_u8(8)));
+    return vcombine_s8(vget_low_s8(lo8), vget_low_s8(hi8));
+}
+```
+
+### Estrutura
+
+- **1×16 (decode)**: `matmul_int4_block_1x16` — 8 chunks de 4 por grupo,
+  4 quartets de linhas, acumuladores `a?l`/`a?h` por quartet.
+- **2×16 (prefill)**: `matmul_int4_block_2x16` — os loads de peso são
+  compartilhados entre dois tokens; a linha ímpar de cauda é tratada com
+  `has_row1 == 0`.
+- **Scale cache**: como no int8, os 16 scales fp16 por (grupo, linha) são
+  convertidos uma única vez para `float32x4_t` antes do loop de linhas.
+- **`quantize_int4`** quantiza as ativações em grupos de 32 para casar com a
+  granularidade dos scales int4.
+
+O driver `matmul_int4` escolhe 1×16 para `rows == 1` e 2×16 caso contrário,
+com `#pragma omp for` sobre os blocos de 16 saídas.
+
+---
+
 ## 11. Otimizações futuras
 
 | Prioridade | Item | Impacto esperado |
