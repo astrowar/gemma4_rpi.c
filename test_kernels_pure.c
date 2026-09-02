@@ -1,8 +1,8 @@
-// Validation: compares kernels_pure.c (scalar) against kernels.c (AVX2/AVX-512)
+// Validation: compares kernels_pure_int8.c (scalar) against kernels_avx_int8.c (AVX2/AVX-512)
 // using real model weights.
 //
 // Build: cc -std=c11 -O3 -Wall -Wextra -march=native -fopenmp
-//        test_kernels_pure.c kernels.c kernels_pure_renamed.c -o test_kernels_pure -lm
+//        test_kernels_pure.c kernels_avx_int8.c kernels_pure_int8_renamed.c -o test_kernels_pure -lm
 // Run:   ./test_kernels_pure ./gemma4-E2B-int8.bin
 
 #include <fcntl.h>

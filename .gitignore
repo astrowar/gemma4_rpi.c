@@ -9,3 +9,4 @@
 /.venv
 /__pycache__/
 /.cache/
+/test_int4_avx

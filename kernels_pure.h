@@ -1,6 +1,7 @@
 // Pure C (scalar) kernel declarations for gemma4.c.
 // No SIMD intrinsics, no architecture-specific code.
 // Designed for portability to any platform with a C11 compiler.
+// Implementation: kernels_pure_int8.c + kernels_pure_int4.c
 
 #ifndef KERNELS_PURE_H
 #define KERNELS_PURE_H

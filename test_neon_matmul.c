@@ -3,7 +3,7 @@
 // matmul_int8 implementations, and reports the max absolute difference.
 //
 // Build (aarch64):
-//   cc -std=c11 -O2 -Wall -Wextra -fopenmp test_neon_matmul.c kernels_neon.c -o test_neon_matmul -lm
+//   cc -std=c11 -O2 -Wall -Wextra -fopenmp test_neon_matmul.c kernels_neon_int8.c -o test_neon_matmul -lm
 // Run:
 //   ./test_neon_matmul
 
@@ -17,12 +17,12 @@
 
 #include "gemma4.h"
 
-// The NEON matmul (from kernels_neon.c).
+// The NEON matmul (from kernels_neon_int8.c).
 extern void matmul_int8(float *output, const int8_t *input_q, const float *input_scales,
                         const Tensor *weight, size_t rows);
 
 // ----------------------------------------------------------------------------
-// Scalar reference (copied from kernels_pure.c)
+// Scalar reference (copied from kernels_pure_int8.c)
 
 static float fp16_to_f32(uint16_t value) {
     int sign = value >> 15;

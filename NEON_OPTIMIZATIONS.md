@@ -12,8 +12,9 @@ O gemma4.c faz inferência de Gemma 4 E2B em C puro, com pesos int8
 `matmul_int8`: para cada token, 35 camadas × ~8 projeções lineares ×
 1536×1536 (ou maiores no MLP).
 
-O kernel NEON (`kernels_neon.c`) substitui o caminho escalar
-(`kernels_pure.c`) e o AVX2 (`kernels.c`) em aarch64.
+O kernel NEON (`kernels_neon_int8.c` + `kernels_neon_int4.c`) substitui o
+caminho escalar (`kernels_pure_int8.c` + `kernels_pure_int4.c`) e o AVX2
+(`kernels_avx_int8.c` + `kernels_avx_int4.c`) em aarch64.
 
 ### Restrições do Cortex-A72
 
@@ -354,7 +355,7 @@ Para ganhos maiores no decode, seria necessário:
 
 ## 10b. Kernel int4 (grupo 32)
 
-Além do int8, o `kernels_neon.c` implementa `matmul_int4` para o formato
+Além do int8, o `kernels_neon_int4.c` implementa `matmul_int4` para o formato
 int4 (dois valores de 4 bits por byte, zero point 8, um scale fp16 por grupo
 de 32 entradas). O layout dos pesos é:
 

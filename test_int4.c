@@ -5,11 +5,11 @@
 // the kernel under test against a direct float reference that dequantizes the
 // exact same packed weights.
 //
-// The same source is compiled against either kernels_pure.c (scalar reference)
-// or kernels_neon.c (NEON) via the Makefile, so one test validates both.
+// The same source is compiled against either kernels_pure_int4.c (scalar reference)
+// or kernels_neon_int4.c (NEON) via the Makefile, so one test validates both.
 //
 // Build (aarch64, NEON):
-//   cc -std=c11 -O2 -Wall -Wextra -fopenmp test_int4.c kernels_neon.c -o test_int4 -lm
+//   cc -std=c11 -O2 -Wall -Wextra -fopenmp test_int4.c kernels_neon_int4.c -o test_int4 -lm
 // Run:
 //   ./test_int4
 

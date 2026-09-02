@@ -12,10 +12,12 @@ gemma4.c/
 ├── gemma4.h             # Shared types, constants, and cross-module declarations
 ├── tokenizer.c          # Tokenizer types + BPE encode/decode
 ├── model.c              # Model loading, memory mapping, tensor offset resolution
-├── kernels.c            # AVX2/AVX-512 int8 kernels: matmul, quantize, attention, GELU
-├── kernels_avx_int4.c   # AVX2 int4 matmul (linked with kernels.c on x86)
-├── kernels_neon.c       # ARM NEON int8 + int4 kernels (aarch64)
-├── kernels_pure.c       # Portable scalar fallback for all kernels
+├── kernels_avx_int8.c   # AVX2/AVX-512 int8 kernels: matmul, quantize, attention, GELU
+├── kernels_avx_int4.c   # AVX2 int4 matmul
+├── kernels_neon_int8.c  # ARM NEON int8 kernels: matmul, quantize, attention, GELU
+├── kernels_neon_int4.c  # ARM NEON int4 matmul
+├── kernels_pure_int8.c  # Portable scalar int8 fallback
+├── kernels_pure_int4.c  # Portable scalar int4 fallback
 ├── transformer.c        # Forward pass: embedding, layernorms, attention, MLP, logits
 ├── generate.c           # Sampling, prefill, generation loop, benchmark
 ├── main.c               # CLI argument parsing, model loading, entry point
@@ -25,10 +27,11 @@ gemma4.c/
 ```
 
 The kernel files are mutually exclusive at build time: the `Makefile` selects
-exactly one of `kernels.c` (+ `kernels_avx_int4.c`), `kernels_neon.c`, or
-`kernels_pure.c` based on the target architecture (or an explicit
-`KERNELS=` override). Each provides the same public kernel interface, so the
-rest of the program is kernel-agnostic.
+exactly one pair — `kernels_avx_int8.c` + `kernels_avx_int4.c`,
+`kernels_neon_int8.c` + `kernels_neon_int4.c`, or
+`kernels_pure_int8.c` + `kernels_pure_int4.c` — based on the target
+architecture (or an explicit `KERNELS=` override). Each pair provides the
+same public kernel interface, so the rest of the program is kernel-agnostic.
 
 ## Function / Type Mapping
 
@@ -67,7 +70,7 @@ Everything that more than one module needs to see:
 
 (These two are extracted from `main()` to keep the entry point thin.)
 
-### `kernels.c` — AVX2 / AVX-512 int8 kernels
+### `kernels_avx_int8.c` — AVX2 / AVX-512 int8 kernels
 
 | Function | Description |
 |---|---|
@@ -82,36 +85,50 @@ Everything that more than one module needs to see:
 
 ### `kernels_avx_int4.c` — AVX2 int4 matmul
 
-Linked alongside `kernels.c` on x86. Provides `matmul_int4` only; the rest of
-the kernel interface comes from `kernels.c`.
+Linked alongside `kernels_avx_int8.c` on x86. Provides `matmul_int4` only;
+the rest of the kernel interface comes from `kernels_avx_int8.c`.
 
 | Function | Description |
 |---|---|
-| `unpack_row_16()` | Split one 16-byte int4 row into even/odd signed int8 vectors (nibble − 8) |
 | `deinterleave_32()` | Split 32 sequential int8 activations into even/odd 16-element vectors |
-| `dot_16()` | 16×16 int8 dot product via `abs`/`sign`/`maddubs`/`madd_epi16` |
-| `matmul_int4_block_1x16()` | GEMV: 1 input row × 16 output rows (decode) |
+| `unpack_rows_2x16()` | 256-bit load of two consecutive 16-byte int4 rows → even/odd YMM vectors |
+| `dot_32_2rows()` | Two 32-term int8 dot products (one per 128-bit half) via `abs`/`sign`/`maddubs`/`madd_epi16`/`hadd_epi32` |
+| `matmul_int4_block_1x16()` | GEMV: 1 input row × 16 output rows (decode), 2 rows per YMM iteration |
 | `matmul_int4_block_2x16()` | GEMM: 2 input rows × 16 output rows (prefill), shared weight loads |
 | `matmul_int4()` | OpenMP-parallel driver over the block kernels |
 
-### `kernels_neon.c` — ARM NEON kernels (aarch64)
+### `kernels_neon_int8.c` — ARM NEON int8 kernels (aarch64)
 
 Base AdvSIMD only (no dotprod/fp16), so it runs on Cortex-A72. Provides the
-full kernel interface for both int8 and int4. See `NEON_OPTIMIZATIONS.md`.
+int8 portion of the kernel interface. See `NEON_OPTIMIZATIONS.md`.
 
 | Function | Description |
 |---|---|
 | `matmul_int8()` | int8 GEMV (1×16) / GEMM (2×16) via `vmull_s8` + `vpadalq_s16` |
-| `matmul_int4()` | int4 GEMV / GEMM; widens nibbles to int8 then reuses the int8 MAC path |
 | `quantize()` / `quantize_int4()` | Dynamic int8 quantization (groups of 64 / 32) |
 | `attention_scores()` / `weighted_value_sum()` / `geglu()` | NEON attention and GELU |
 
-### `kernels_pure.c` — portable scalar fallback
+### `kernels_neon_int4.c` — ARM NEON int4 matmul (aarch64)
+
+Provides `matmul_int4` only; the rest of the kernel interface comes from
+`kernels_neon_int8.c`.
+
+| Function | Description |
+|---|---|
+| `int4_row_to_s8()` | Widen one 16-byte int4 row (32 nibbles) to signed int8x16 |
+| `matmul_int4_block_1x16()` | GEMV: 1 input row × 16 output rows (decode) |
+| `matmul_int4_block_2x16()` | GEMM: 2 input rows × 16 output rows (prefill), shared weight loads |
+| `matmul_int4()` | OpenMP-parallel driver over the block kernels |
+
+### `kernels_pure_int8.c` — portable scalar int8 fallback
 
 No SIMD intrinsics; the reference implementation selected when AVX2/NEON are
-unavailable. Provides the same interface as the other kernel files, including
-`matmul_int8`, `matmul_int4`, `quantize`, `quantize_int4`, and the attention
-primitives.
+unavailable. Provides `matmul_int8`, `quantize`, `quantize_int4`,
+`attention_scores`, `weighted_value_sum`, and `geglu`.
+
+### `kernels_pure_int4.c` — portable scalar int4 fallback
+
+Provides `matmul_int4` only. Scalar reference for the int4 weight format.
 
 ### `transformer.c` — Model forward pass
 
@@ -157,9 +174,9 @@ CC = cc
 CFLAGS_BASE = -std=c11 -O3 -Wall -Wextra -fopenmp
 LDFLAGS = -lm
 
-# x86 with AVX2:  KERNEL_SRC = kernels.c kernels_avx_int4.c   (-march=native)
-# aarch64:        KERNEL_SRC = kernels_neon.c                 (-mcpu=cortex-a72)
-# otherwise:      KERNEL_SRC = kernels_pure.c
+# x86 with AVX2:  KERNEL_SRC = kernels_avx_int8.c kernels_avx_int4.c   (-march=native)
+# aarch64:        KERNEL_SRC = kernels_neon_int8.c kernels_neon_int4.c (-mcpu=cortex-a72)
+# otherwise:      KERNEL_SRC = kernels_pure_int8.c kernels_pure_int4.c
 # override with:  KERNELS=pure | avx2 | neon
 
 SRCS = tokenizer.c model.c $(KERNEL_SRC) transformer.c generate.c main.c

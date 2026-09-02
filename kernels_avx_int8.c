@@ -1,9 +1,9 @@
-// AVX2 / AVX-512 VNNI kernel implementations.
+// AVX2 / AVX-512 VNNI int8 kernel implementations.
 // Only compiled when the target supports AVX2 (see Makefile).
-// For portable scalar fallback, see kernels_pure.c.
+// For portable scalar fallback, see kernels_pure_int8.c.
 
 #if !defined(__AVX2__)
-#error "kernels.c requires -mavx2 (or -march=native on an AVX2 CPU). Use kernels_pure.c for scalar targets."
+#error "kernels_avx_int8.c requires -mavx2 (or -march=native on an AVX2 CPU). Use kernels_pure_int8.c for scalar targets."
 #endif
 
 #include "gemma4.h"
@@ -84,7 +84,7 @@ void matmul_int8(float *output, const int8_t *input_q, const float *input_scales
         matmul_block(output, input_q, input_scales, weight, rows, output_block);
 }
 
-// matmul_int4 lives in kernels_avx_int4.c (AVX2/AVX-512 SIMD implementation).
+// matmul_int4 lives in kernels_avx_int4.c.
 
 // Converts each input row to int8 in groups of 64 values with a float scale recording each group's magnitude.
 void quantize(int8_t *quantized, float *scales, const float *input, size_t rows, size_t width) {

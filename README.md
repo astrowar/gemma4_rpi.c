@@ -58,9 +58,9 @@ The `Makefile` picks the kernel implementation automatically: AVX2/AVX-512 on x8
 
 | Kernels | Files | Weights |
 | ------- | ----- | ------- |
-| `avx2` / `native` | `kernels.c` (int8) + `kernels_avx_int4.c` (int4) | int8, int4 |
-| `neon` | `kernels_neon.c` | int8, int4 |
-| `pure` | `kernels_pure.c` | int8, int4 |
+| `avx2` / `native` | `kernels_avx_int8.c` + `kernels_avx_int4.c` | int8, int4 |
+| `neon` | `kernels_neon_int8.c` + `kernels_neon_int4.c` | int8, int4 |
+| `pure` | `kernels_pure_int8.c` + `kernels_pure_int4.c` | int8, int4 |
 
 ## Options
 
@@ -126,10 +126,12 @@ python3 validation.py 64
 - `gemma4.h` — shared types, constants, and cross-module declarations.
 - `tokenizer.c` — BPE encode/decode.
 - `model.c` — model loading, memory mapping, tensor offset resolution.
-- `kernels.c` — AVX2/AVX-512 int8 matmul, quantize, attention, GELU.
-- `kernels_avx_int4.c` — AVX2 int4 matmul (linked with `kernels.c` on x86).
-- `kernels_neon.c` — ARM NEON int8 and int4 kernels (aarch64).
-- `kernels_pure.c` — portable scalar fallback for all kernels.
+- `kernels_avx_int8.c` — AVX2/AVX-512 int8 matmul, quantize, attention, GELU.
+- `kernels_avx_int4.c` — AVX2 int4 matmul.
+- `kernels_neon_int8.c` — ARM NEON int8 matmul, quantize, attention, GELU.
+- `kernels_neon_int4.c` — ARM NEON int4 matmul.
+- `kernels_pure_int8.c` — portable scalar int8 fallback.
+- `kernels_pure_int4.c` — portable scalar int4 fallback.
 - `transformer.c` — forward pass: embedding, layernorms, attention, MLP, logits.
 - `generate.c` — sampling, prefill, generation loop, benchmark.
 - `main.c` — CLI argument parsing, model loading, entry point.

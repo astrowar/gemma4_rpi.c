@@ -157,7 +157,7 @@ Model *model_load(const char *path);
 void model_unload(Model *model, size_t size);
 
 // ----------------------------------------------------------------------------
-// kernels.c
+// kernels_avx_int8.c / kernels_pure_int8.c / kernels_neon_int8.c
 
 void matmul_int8(float *output, const int8_t *input_q, const float *input_scales,
                  const Tensor *weight, size_t rows);
