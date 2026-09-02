@@ -1,6 +1,8 @@
-# gemma4.c
+# gemma4_rpi.c
 
 Gemma 4 E2B CPU inference in pure C.
+
+> **Fork** of [ryanssenn/gemma4.c](https://github.com/ryanssenn/gemma4.c) — optimized for Raspberry Pi (aarch64/NEON) with int4 kernel support.
 
 An educational project made to understand how LLM inference works. The full inference path is implemented without external libraries. Matrix weights can be stored as int8 (group of 64) or int4 (group of 32, two 4-bit values per byte); inputs to linear layers are dynamically quantized to int8 in either case.
 
@@ -28,8 +30,8 @@ You need an OpenMP-capable C compiler and `make`. On x86, AVX2 is required for t
 Clone the repository and download a ready-to-run model:
 
 ```bash
-git clone https://github.com/ryanssenn/gemma4.c
-cd gemma4.c
+git clone https://github.com/astrowar/gemma4_rpi.c
+cd gemma4_rpi.c
 python3 -m pip install -U huggingface_hub
 hf download QmogAI/gemma4-e2b-int8 gemma4-E2B-int8.bin --local-dir .
 # or the smaller int4 variant:
