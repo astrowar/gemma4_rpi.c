@@ -10,17 +10,29 @@ An educational project made to understand how LLM inference works. The full infe
 
 ## Benchmark
 
-Measured on an AMD Ryzen 7 7700 using the default native build.
+### AMD Ryzen 7 7700 (original)
+
+Measured using the default native build (AVX2, 8 threads).
 
 | Implementation | Prefill (pp512) | Decode (tg128@d512) |
 | -------------- | --------------: | ------------------: |
 | gemma4.c (int8) | 632.84 ± 6.07 tok/s | 25.01 ± 0.07 tok/s |
 | llama.cpp (Q8_0) | 262.16 ± 1.19 tok/s | 23.19 ± 0.03 tok/s |
 
-Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup, with each runtime using its fastest tested thread count. Both were built natively for CPU and dynamically quantize matrix inputs to int8.
+### Intel Xeon E5-2690 v4 (this fork)
+
+Measured with AVX2 kernels, `OMP_NUM_THREADS=14` (14 physical cores).
+
+| Implementation | Prefill (pp512) | Decode (tg128@d512) |
+| -------------- | --------------: | ------------------: |
+| gemma4_rpi.c (int8) | 142.54 ± 4.35 tok/s | 19.92 ± 0.29 tok/s |
+| gemma4_rpi.c (int4) | 57.76 ± 1.85 tok/s | 26.17 ± 0.69 tok/s |
+
+Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup.
 
 ```bash
-./run -m ./gemma4-E2B-int8.bin --bench 512 128
+OMP_NUM_THREADS=14 ./run -m ./gemma4-E2B-int8.bin -t 0 --bench 512 128
+OMP_NUM_THREADS=14 ./run -m ./gemma4-E2B-int4.bin -t 0 --bench 512 128
 ```
 
 ## Quick start
