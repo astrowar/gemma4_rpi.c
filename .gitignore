@@ -2,6 +2,7 @@
 /gemma4-E2B-int4.bin
 /run
 /run.exe
+/run_profile
 /test_neon_matmul
 /test_kernels_pure
 /test_int4_pure

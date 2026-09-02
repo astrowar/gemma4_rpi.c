@@ -155,9 +155,24 @@ static inline int thread_count(void) {
         int v = atoi(env);
         if (v >= os_cpus) return v;
     }
-    // Default: physical cores (logical / 2 to exclude HT siblings).
-    // HT shares execution units and hurts memory-bound kernels.
+    // Default: physical cores. Detect HT via thread_siblings_list;
+    // if no HT (e.g. ARM), use all cores.
+#if defined(__linux__)
+    FILE *f = fopen("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "r");
+    int physical = os_cpus;
+    if (f) {
+        char buf[64] = {0};
+        if (fread(buf, 1, sizeof(buf)-1, f)) {
+            fclose(f);
+            // If siblings list has more than one entry, HT is present.
+            if (strchr(buf, ',')) physical = os_cpus / 2;
+        } else {
+            fclose(f);
+        }
+    }
+#else
     int physical = os_cpus / 2;
+#endif
     return physical > 0 ? physical : 1;
 }
 
