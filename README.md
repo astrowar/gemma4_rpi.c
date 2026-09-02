@@ -72,9 +72,9 @@ The `Makefile` picks the kernel implementation automatically: AVX2/AVX-512 on x8
 
 | Kernels | Files | Weights |
 | ------- | ----- | ------- |
-| `avx2` / `native` | `kernels_avx_int8.c` + `kernels_avx_int4.c` | int8, int4 |
-| `neon` | `kernels_neon_int8.c` + `kernels_neon_int4.c` | int8, int4 |
-| `pure` | `kernels_pure_int8.c` + `kernels_pure_int4.c` | int8, int4 |
+| `avx2` / `native` | `src/kernels_avx_int8.c` + `src/kernels_avx_int4.c` | int8, int4 |
+| `neon` | `src/kernels_neon_int8.c` + `src/kernels_neon_int4.c` | int8, int4 |
+| `pure` | `src/kernels_pure_int8.c` + `src/kernels_pure_int4.c` | int8, int4 |
 
 ## Options
 
@@ -99,9 +99,9 @@ To create a model file yourself:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized -o ./gemma4-E2B-int8.bin
+python3 tools/exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized -o ./gemma4-E2B-int8.bin
 # or the int4 variant:
-python3 exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized --quant int4 -o ./gemma4-E2B-int4.bin
+python3 tools/exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized --quant int4 -o ./gemma4-E2B-int4.bin
 ```
 
 Python is only needed to export the model or run numerical validation. Once the `.bin` file exists, inference runs entirely through the C program.
@@ -120,13 +120,13 @@ An exact match is not expected because gemma4.c uses int8 matrix weights and lin
 Build the C runtime first (`make` or `make win64`). The complete validation peaks at about 10 GiB of RAM:
 
 ```bash
-python3 validation.py
+python3 tools/validation.py
 ```
 
 Pass a smaller token count for a quicker check:
 
 ```bash
-python3 validation.py 64
+python3 tools/validation.py 64
 ```
 
 `validation.py` uses the runtime's `--dump-logits` flag to collect float32 logits after each prompt position. The flag can also be used directly when comparing gemma4.c with another implementation:
@@ -137,20 +137,36 @@ python3 validation.py 64
 
 ## Repository contents
 
-- `gemma4.h` — shared types, constants, and cross-module declarations.
-- `tokenizer.c` — BPE encode/decode.
-- `model.c` — model loading, memory mapping, tensor offset resolution.
-- `kernels_avx_int8.c` — AVX2/AVX-512 int8 matmul, quantize, attention, GELU.
-- `kernels_avx_int4.c` — AVX2 int4 matmul.
-- `kernels_neon_int8.c` — ARM NEON int8 matmul, quantize, attention, GELU.
-- `kernels_neon_int4.c` — ARM NEON int4 matmul.
-- `kernels_pure_int8.c` — portable scalar int8 fallback.
-- `kernels_pure_int4.c` — portable scalar int4 fallback.
-- `transformer.c` — forward pass: embedding, layernorms, attention, MLP, logits.
-- `generate.c` — sampling, prefill, generation loop, benchmark.
-- `main.c` — CLI argument parsing, model loading, entry point.
-- `exporter.py` converts the original checkpoint into the binary layout read by the C runtime.
-- `validation.py` compares the runtime's logits with Hugging Face Transformers.
-- `validation.txt` contains the WikiText-103 passage used for numerical validation.
-- `win.c` and `win.h` provide the small Windows memory-mapping compatibility layer.
-- `Makefile` builds the Linux or Windows executable.
+```
+├── Makefile              — builds the Linux or Windows executable
+├── gemma4.h              — shared types, constants, and cross-module declarations
+├── src/
+│   ├── main.c            — CLI argument parsing, model loading, entry point
+│   ├── model.c           — model loading, memory mapping, tensor offset resolution
+│   ├── tokenizer.c       — BPE encode/decode
+│   ├── transformer.c     — forward pass: embedding, layernorms, attention, MLP, logits
+│   ├── generate.c        — sampling, prefill, generation loop, benchmark
+│   ├── kernels_avx_int8.c   — AVX2/AVX-512 int8 matmul, quantize, attention, GELU
+│   ├── kernels_avx_int4.c   — AVX2 int4 matmul
+│   ├── kernels_neon_int8.c  — ARM NEON int8 matmul, quantize, attention, GELU
+│   ├── kernels_neon_int4.c  — ARM NEON int4 matmul
+│   ├── kernels_pure_int8.c  — portable scalar int8 fallback
+│   ├── kernels_pure_int4.c  — portable scalar int4 fallback
+│   ├── kernels_pure.h       — scalar kernel declarations
+│   ├── win.c / win.h        — Windows memory-mapping compatibility layer
+├── tests/
+│   ├── test_int4.c       — int4 matmul correctness vs float reference
+│   ├── test_kernels_pure.c — scalar kernel tests
+│   └── test_neon_matmul.c  — NEON matmul correctness vs scalar reference
+├── profile/
+│   ├── profile.c         — per-component timing instrumentation
+│   └── profile_main.c    — profile entry point
+├── tools/
+│   ├── exporter.py       — converts the original checkpoint into the binary layout
+│   └── validation.py     — compares the runtime's logits with Hugging Face Transformers
+└── docs/
+    ├── DOCS_avx_int4.md  — AVX2 int4 kernel design notes
+    ├── DOCS_neon_int4.md — NEON int4 kernel design & benchmarks
+    ├── NEON_OPTIMIZATIONS.md — NEON optimization history
+    └── REFACTOR_PLAN.md  — refactoring notes
+```

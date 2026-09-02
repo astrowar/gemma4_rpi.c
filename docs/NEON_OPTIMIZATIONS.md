@@ -419,3 +419,70 @@ com `#pragma omp for` sobre os blocos de 16 saídas.
 - [Arm Cortex-A Comparison Table](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Cortex-A%20R%20M%20datasheets/Arm%20Cortex-A%20Comparison%20Table_v4.pdf)
 - [Arm NEON Programming Quick Reference](https://developer.arm.com/community/arm-community-blogs/b/operating-systems-blog/posts/arm-neon-programming-quick-reference)
 - [AArch64 NEON Intrinsics (ARM)](https://developer.arm.com/documentation/100952/latest/)
+
+---
+
+## 13. Comandos úteis (sintaxe e o que fazem)
+
+### 13.1 Build e limpeza
+
+- Sintaxe: `make clean`
+- O que faz: remove artefatos antigos para evitar comparar resultados com binários desatualizados.
+
+- Sintaxe: `make -j`
+- O que faz: compila em paralelo para reduzir tempo de build.
+
+- Sintaxe: `make -j KERNELS=neon`
+- O que faz: força build com kernels NEON no alvo aarch64.
+
+### 13.2 Testes de corretude
+
+- Sintaxe: `make test-neon-matmul`
+- O que faz: valida `matmul` NEON contra referência escalar e detecta regressões numéricas.
+
+- Sintaxe: `make test-int4-pure`
+- O que faz: valida o caminho escalar `int4`, útil como baseline de corretude.
+
+- Sintaxe: `make test_int4_avx`
+- O que faz: valida caminho AVX2 `int4` em x86 (quando aplicável), útil para comparação cruzada.
+
+### 13.3 Execução e benchmark
+
+- Sintaxe: `OMP_NUM_THREADS=4 ./run --bench`
+- O que faz: executa benchmark integrado e reporta throughput de prefill/decode.
+
+- Sintaxe: `OMP_NUM_THREADS=4 ./run -z "What is the capital of France?"`
+- O que faz: testa inferência fim a fim com prompt fixo para validação funcional.
+
+- Sintaxe: `for i in $(seq 1 10); do OMP_NUM_THREADS=4 ./run --bench; done`
+- O que faz: repete benchmark para gerar média e reduzir ruído de medição.
+
+### 13.4 Reprodutibilidade
+
+- Sintaxe: `taskset -c 0-3 OMP_NUM_THREADS=4 ./run --bench`
+- O que faz: fixa afinidade de CPU para reduzir variação entre rodadas.
+
+- Sintaxe: `/usr/bin/time -v sh -c 'OMP_NUM_THREADS=4 ./run --bench'`
+- O que faz: coleta tempo total e memória máxima para comparação de eficiência.
+
+### 13.5 Profiling rápido
+
+- Sintaxe: `perf stat -d sh -c 'OMP_NUM_THREADS=4 ./run --bench'`
+- O que faz: coleta contadores de desempenho (IPC, cache misses, branches) para localizar gargalos.
+
+- Sintaxe: `perf record -g sh -c 'OMP_NUM_THREADS=4 ./run --bench' && perf report`
+- O que faz: gera perfil de hotspots com call graph para priorizar otimizações de maior impacto.
+
+### 13.6 Inspeção de binário/assembly
+
+- Sintaxe: `nm -C ./run | grep -E 'matmul_int4|matmul_int8'`
+- O que faz: confirma presença dos símbolos esperados no binário.
+
+- Sintaxe: `objdump -d ./run | less`
+- O que faz: permite inspecionar assembly e verificar se instruções NEON esperadas foram emitidas.
+
+### 13.7 Boas práticas de medição
+
+- Use sempre mesmo número de threads (`OMP_NUM_THREADS`).
+- Compare média de múltiplas rodadas, nunca apenas uma execução.
+- Rode primeiro testes de corretude e depois benchmark.
