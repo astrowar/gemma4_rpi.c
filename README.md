@@ -21,18 +21,18 @@ Measured using the default native build (AVX2, 8 threads).
 
 ### Intel Xeon E5-2690 v4 (this fork)
 
-Measured with AVX2 kernels, `OMP_NUM_THREADS=14` (14 physical cores).
+Measured with AVX2 kernels on 14 physical cores. Thread count is auto-detected (physical cores, HT siblings excluded), so no `OMP_NUM_THREADS` is needed. Use `GEMMA4_THREADS=N` to override explicitly.
 
 | Implementation | Prefill (pp512) | Decode (tg128@d512) |
 | -------------- | --------------: | ------------------: |
-| gemma4_rpi.c (int8) | 142.54 ± 4.35 tok/s | 19.92 ± 0.29 tok/s |
-| gemma4_rpi.c (int4) | 57.76 ± 1.85 tok/s | 26.17 ± 0.69 tok/s |
+| gemma4_rpi.c (int8) | 151.51 tok/s | 21.01 tok/s |
+| gemma4_rpi.c (int4) | 57.54 tok/s | 26.95 tok/s |
 
-Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup.
+Hyperthreading (28 threads) hurts performance: ~163 tok/s prefill, ~20 tok/s decode (vs 151/21 on 14 physical cores).
 
 ```bash
-OMP_NUM_THREADS=14 ./run -m ./gemma4-E2B-int8.bin -t 0 --bench 512 128
-OMP_NUM_THREADS=14 ./run -m ./gemma4-E2B-int4.bin -t 0 --bench 512 128
+./run -m ./gemma4-E2B-int8.bin -t 0 --bench 512 128
+./run -m ./gemma4-E2B-int4.bin -t 0 --bench 512 128
 ```
 
 ## Quick start

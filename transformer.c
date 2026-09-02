@@ -15,7 +15,7 @@ static float fp16_to_f32(uint16_t value) {
 // Dispatches a linear layer to the kernel matching the model's weight format.
 // Activations are always dynamically int8-quantized; only the stored weights
 // differ between int8 and int4.
-static inline void matmul_dispatch(Model *model, float *output, const int8_t *input_q,
+void matmul_dispatch(Model *model, float *output, const int8_t *input_q,
                                    const float *input_scales, const Tensor *weight, size_t rows) {
     if (model->quant == QUANT_INT4) matmul_int4(output, input_q, input_scales, weight, rows);
     else matmul_int8(output, input_q, input_scales, weight, rows);
@@ -72,7 +72,7 @@ void embedding_int4(float *output, const Tensor *table, const int *tokens, size_
 }
 
 // Dispatches embedding lookup to the kernel matching the model's weight format.
-static inline void embedding_dispatch(Model *model, float *output, const Tensor *table,
+void embedding_dispatch(Model *model, float *output, const Tensor *table,
                                       const int *tokens, size_t token_count, float multiplier) {
     if (model->quant == QUANT_INT4)
         embedding_int4(output, table, tokens, token_count, multiplier);
@@ -82,7 +82,7 @@ static inline void embedding_dispatch(Model *model, float *output, const Tensor 
 
 // Dispatches activation quantization to match the weight scale granularity.
 // int8 weights use group 64; int4 weights use group 32.
-static inline void quantize_dispatch(Model *model, int8_t *output, float *scales,
+void quantize_dispatch(Model *model, int8_t *output, float *scales,
                                      const float *input, size_t rows, size_t width) {
     if (model->quant == QUANT_INT4)
         quantize_int4(output, scales, input, rows, width);

@@ -6,12 +6,16 @@
 #include <time.h>
 
 // Functions defined in transformer.c / generate.c (not in gemma4.h).
-extern void embedding(float *output, const Tensor *table, const int *tokens, size_t token_count, float multiplier);
 extern void rmsnorm(float *output, const float *input, const Tensor *weight, int width, float epsilon, size_t row_count);
 extern void add_and_scale(float *output, const float *addend, size_t count, float scale);
 extern void apply_rope(const Tensor *cosines, const Tensor *sines, float *vectors, int num_heads, int head_dim, int start_pos, size_t token_count);
 extern void softmax(float *values, int count);
 extern int sample(float *logits, int vocab_size, float temperature);
+
+// Dispatchers from transformer.c — route to int8 or int4 based on model->quant.
+extern void embedding_dispatch(Model *model, float *output, const Tensor *table, const int *tokens, size_t token_count, float multiplier);
+extern void quantize_dispatch(Model *model, int8_t *output, float *scales, const float *input, size_t rows, size_t width);
+extern void matmul_dispatch(Model *model, float *output, const int8_t *input_q, const float *input_scales, const Tensor *weight, size_t rows);
 
 // --- Accumulators (thread-safe via omp critical) ---
 static double t_embedding, t_rmsnorm, t_quantize, t_matmul, t_attention,
@@ -40,19 +44,19 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
         float scores[(size_t)start_pos + token_count];
 
         TIMED(t_embedding,
-            embedding(state->residual, &model->weights.embed, tokens, token_count, sqrtf((float)HIDDEN_SIZE)));
+            embedding_dispatch(model, state->residual, &model->weights.embed, tokens, token_count, sqrtf((float)HIDDEN_SIZE)));
 
         TIMED(t_quantize,
-            quantize(state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE));
+            quantize_dispatch(model, state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE));
 
         TIMED(t_matmul,
-            matmul_int8(state->per_layer_inputs, state->quantized, state->activation_scales, &model->weights.per_layer_model_projection, token_count));
+            matmul_dispatch(model, state->per_layer_inputs, state->quantized, state->activation_scales, &model->weights.per_layer_model_projection, token_count));
 
         TIMED(t_rmsnorm,
             rmsnorm(state->per_layer_inputs, state->per_layer_inputs, &model->weights.per_layer_projection_norm, per_layer_width, 1e-6f * HIDDEN_SIZE, token_count * NUM_LAYERS));
 
         TIMED(t_embedding,
-            embedding(state->hidden, &model->weights.embed_per_layer, tokens, token_count, sqrtf((float)per_layer_width)));
+            embedding_dispatch(model, state->hidden, &model->weights.embed_per_layer, tokens, token_count, sqrtf((float)per_layer_width)));
 
         TIMED(t_add_scale,
             add_and_scale(state->per_layer_inputs, state->hidden, token_count * NUM_LAYERS * per_layer_width, 1.0f / sqrtf(2.0f)));
@@ -77,10 +81,10 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
                 float *value_cache = key_cache + (size_t)cache_len * head_dim;
 
                 TIMED(t_quantize,
-                    quantize(state->quantized, state->activation_scales, state->hidden, token_count, lw->q_proj.shape[1]));
+                    quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, token_count, lw->q_proj.shape[1]));
 
                 TIMED(t_matmul,
-                    matmul_int8(state->auxiliary, state->quantized, state->activation_scales, &lw->q_proj, token_count));
+                    matmul_dispatch(model, state->auxiliary, state->quantized, state->activation_scales, &lw->q_proj, token_count));
 
                 TIMED(t_rmsnorm,
                     rmsnorm(state->auxiliary, state->auxiliary, &lw->q_norm, head_dim, 1e-6f, token_count * (query_width / head_dim)));
@@ -93,10 +97,10 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
                     float *new_values = value_cache + ((size_t)start_pos & cache_mask) * head_dim;
 
                     TIMED(t_matmul,
-                        matmul_int8(new_keys, state->quantized, state->activation_scales, &lw->k_proj, token_count));
+                        matmul_dispatch(model, new_keys, state->quantized, state->activation_scales, &lw->k_proj, token_count));
 
                     TIMED(t_matmul,
-                        matmul_int8(new_values, state->quantized, state->activation_scales, &lw->v_proj, token_count));
+                        matmul_dispatch(model, new_values, state->quantized, state->activation_scales, &lw->v_proj, token_count));
 
                     TIMED(t_rmsnorm,
                         rmsnorm(new_keys, new_keys, &lw->k_norm, head_dim, 1e-6f, token_count));
@@ -128,10 +132,10 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
                 }
 
                 TIMED(t_quantize,
-                    quantize(state->quantized, state->activation_scales, state->hidden, token_count, lw->o_proj.shape[1]));
+                    quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, token_count, lw->o_proj.shape[1]));
 
                 TIMED(t_matmul,
-                    matmul_int8(state->hidden, state->quantized, state->activation_scales, &lw->o_proj, token_count));
+                    matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &lw->o_proj, token_count));
             }
 
             TIMED(t_rmsnorm,
@@ -145,22 +149,22 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
                 rmsnorm(state->hidden, state->residual, &weights->pre_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count));
 
             TIMED(t_quantize,
-                quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->gate_proj.shape[1]));
+                quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, token_count, weights->gate_proj.shape[1]));
 
             TIMED(t_matmul,
-                matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->gate_proj, token_count));
+                matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->gate_proj, token_count));
 
             TIMED(t_matmul,
-                matmul_int8(state->auxiliary, state->quantized, state->activation_scales, &weights->up_proj, token_count));
+                matmul_dispatch(model, state->auxiliary, state->quantized, state->activation_scales, &weights->up_proj, token_count));
 
             TIMED(t_geglu,
                 geglu(state->hidden, state->auxiliary, token_count, weights->gate_proj.shape[0], weights->gate_proj.shape[0], &model->weights.gelu_table));
 
             TIMED(t_quantize,
-                quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->down_proj.shape[1]));
+                quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, token_count, weights->down_proj.shape[1]));
 
             TIMED(t_matmul,
-                matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->down_proj, token_count));
+                matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->down_proj, token_count));
 
             TIMED(t_rmsnorm,
                 rmsnorm(state->hidden, state->hidden, &weights->post_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count));
@@ -170,19 +174,19 @@ void prof_forward(Model *model, InferenceState *state, const int *tokens,
 
             // --- Per-layer projection ---
             TIMED(t_quantize,
-                quantize(state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE));
+                quantize_dispatch(model, state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE));
 
             TIMED(t_matmul,
-                matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->per_layer_input_gate, token_count));
+                matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->per_layer_input_gate, token_count));
 
             TIMED(t_geglu,
                 geglu(state->hidden, state->per_layer_inputs + layer * per_layer_width, token_count, per_layer_width, NUM_LAYERS * per_layer_width, &model->weights.gelu_table));
 
             TIMED(t_quantize,
-                quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->per_layer_projection.shape[1]));
+                quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, token_count, weights->per_layer_projection.shape[1]));
 
             TIMED(t_matmul,
-                matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->per_layer_projection, token_count));
+                matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &weights->per_layer_projection, token_count));
 
             TIMED(t_rmsnorm,
                 rmsnorm(state->hidden, state->hidden, &weights->post_per_layer_input_norm, HIDDEN_SIZE, 1e-6f, token_count));
@@ -202,10 +206,10 @@ float *prof_logits(Model *model, InferenceState *state, size_t token) {
             rmsnorm(state->hidden, state->residual + token * HIDDEN_SIZE, &model->weights.norm, HIDDEN_SIZE, 1e-6f, 1));
 
         TIMED(t_quantize,
-            quantize(state->quantized, state->activation_scales, state->hidden, 1, HIDDEN_SIZE));
+            quantize_dispatch(model, state->quantized, state->activation_scales, state->hidden, 1, HIDDEN_SIZE));
 
         TIMED(t_matmul,
-            matmul_int8(state->hidden, state->quantized, state->activation_scales, &model->weights.embed, 1));
+            matmul_dispatch(model, state->hidden, state->quantized, state->activation_scales, &model->weights.embed, 1));
 
         {
             double _t0 = now();

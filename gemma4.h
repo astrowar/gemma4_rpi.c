@@ -131,17 +131,40 @@ _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && 
 // ----------------------------------------------------------------------------
 // Shared helpers
 
-// Uses one OpenMP thread per physical core because each core already uses SIMD, unless OMP_NUM_THREADS overrides it.
+// Returns the number of threads to use for OpenMP parallel regions.
+// Priority: GEMMA4_THREADS env > OMP_NUM_THREADS (if >= CPU count) > physical core count.
+// Conda sets OMP_NUM_THREADS=1 which would cap all regions; we ignore values
+// lower than the CPU count. Hyperthreading siblings are excluded (dividing by 2)
+// because they share execution units and hurt memory-bound workloads.
 static inline int thread_count(void) {
-#if defined(__x86_64__) || defined(__i386__)
-    unsigned int eax, ebx, ecx, edx;
-    __cpuid_count(0xB, 0, eax, ebx, ecx, edx);
-    int logical_cpus = omp_get_num_procs();
-    int threads_per_core = ebx & 0xffff;
-    return getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : logical_cpus / (threads_per_core ? threads_per_core : 1);
-#else
-    return getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : omp_get_num_procs();
+    // GEMMA4_THREADS takes highest priority — explicit user override.
+    const char *g4 = getenv("GEMMA4_THREADS");
+    if (g4) {
+        int v = atoi(g4);
+        if (v > 0) return v;
+    }
+    int os_cpus = omp_get_num_procs();
+#if defined(__linux__)
+    long sys_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (sys_cpus > os_cpus) os_cpus = (int)sys_cpus;
 #endif
+    // OMP_NUM_THREADS is respected only if it's >= the CPU count
+    // (i.e. the user explicitly wants to use all or more threads).
+    const char *env = getenv("OMP_NUM_THREADS");
+    if (env) {
+        int v = atoi(env);
+        if (v >= os_cpus) return v;
+    }
+    // Default: physical cores (logical / 2 to exclude HT siblings).
+    // HT shares execution units and hurts memory-bound kernels.
+    int physical = os_cpus / 2;
+    return physical > 0 ? physical : 1;
+}
+
+// Call once at startup to force the OpenMP runtime to use the correct thread count.
+// Without this, libgomp may read OMP_NUM_THREADS=1 from conda and cap all regions.
+static inline void omp_init(void) {
+    omp_set_num_threads(thread_count());
 }
 
 // ----------------------------------------------------------------------------

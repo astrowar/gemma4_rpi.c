@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
     InferenceState *state = calloc(1, sizeof(*state));
 
     seed_rng();
+    omp_init();
     prof_generate(model, state, prompt, max_new_tokens, temperature);
     free(state);
     munmap(model, (size_t)st.st_size);

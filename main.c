@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
     InferenceState *state = calloc(1, sizeof(*state));
 
     seed_rng();
+    omp_init();
     if (benchmark_mode) benchmark(model, state, prefill_tokens, generated_tokens);
     else generate(model, state, prompt, max_new_tokens, temperature, dump_logits, stats);
     free(state);
