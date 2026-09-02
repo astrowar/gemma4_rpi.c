@@ -13,7 +13,7 @@ ifeq ($(KERNELS),pure)
   ARCH = pure
 else ifeq ($(KERNELS),avx2)
   KERNEL_SRC = kernels.c kernels_avx_int4.c
-  CFLAGS = $(CFLAGS_BASE) -mavx2 -mfma
+  CFLAGS = $(CFLAGS_BASE) -mavx2 -mfma -mf16c
   ARCH = avx2
 else ifeq ($(KERNELS),neon)
   KERNEL_SRC = kernels_neon.c
