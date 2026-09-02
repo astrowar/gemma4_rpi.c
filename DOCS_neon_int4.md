@@ -76,8 +76,6 @@ Measured with `OMP_NUM_THREADS=4`, model `gemma4-E2B-int4.bin` (2707.8 MB):
 
 | Metric | Before optimization | After optimization | Change |
 |--------|:-:|:-:|:-:|
-| pp32 (benchmark) | 5.50 tok/s | **7.77 tok/s** | **+41%** |
-| tg32 (benchmark) | 2.58 tok/s | **2.75 tok/s** | +6.6% |
 | pp512 (benchmark) | 4.06 tok/s | **6.27 tok/s** | **+54%** |
 | tg128@d512 (benchmark) | 1.92 tok/s | **2.15 tok/s** | +12% |
 | Prefill (16 tok, real prompt) | 2.6 tok/s | **7.5 tok/s** | **+188%** |
@@ -85,10 +83,10 @@ Measured with `OMP_NUM_THREADS=4`, model `gemma4-E2B-int4.bin` (2707.8 MB):
 
 Comparison with int8 on the same hardware:
 
-| Model | pp32 (tok/s) | tg32 (tok/s) | pp512 (tok/s) | tg128@d512 (tok/s) |
-|-------|:-:|:-:|:-:|:-:|
-| int8  | 11.78 | 1.54 | 7.57 | 1.33 |
-| int4 (optimized) | 7.77 | 2.75 | 6.27 | 2.15 |
+| Model | pp512 (tok/s) | tg128@d512 (tok/s) |
+|-------|:-:|:-:|
+| int8  | 7.57 | 1.33 |
+| int4 (optimized) | 6.27 | 2.15 |
 
 The int4 kernel now reaches 83% of int8 prefill throughput (pp512) and
 **162% of int8 decode throughput** (tg128). Int4 decode benefits from half
