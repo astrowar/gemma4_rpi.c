@@ -153,8 +153,12 @@ void generate_audio(Model *model, InferenceState *state, const char *audio_path,
         return;
     }
 
-    // Build token sequence: prefix + boa + [audio]*N + eoa + prompt + suffix
+    // Build token sequence matching the official transformers pipeline:
+    // <bos> + <|turn>user\n + [text prompt] + N×AUDIO_TOKEN + <turn|>\n<|turn>model\n
     int pos = 0;
+
+    // BOS token
+    state->token_ids[pos++] = 2; // <bos>
 
     // Prefix: "<|turn>user\n"
     const char *prefix_seg[3] = {"<|turn>user\n", "", ""};
@@ -162,22 +166,16 @@ void generate_audio(Model *model, InferenceState *state, const char *audio_path,
     if (n_prefix < 0) { fprintf(stderr, "prefix too long\n"); return; }
     pos += n_prefix;
 
-    // BOA token
-    state->token_ids[pos++] = AUDIO_BOA_ID;
-
-    // Audio placeholder tokens
-    state->audio_start = pos;
-    for (int i = 0; i < audio_count; i++)
-        state->token_ids[pos++] = AUDIO_TOKEN_ID;
-
-    // EOA token
-    state->token_ids[pos++] = AUDIO_EOA_ID;
-
-    // User prompt
+    // User prompt (text comes BEFORE audio, matching the official pipeline)
     const char *prompt_seg[3] = {"", prompt, ""};
     int n_prompt = tokenize(tokenizer, prompt_seg, state->token_ids + pos, MAX_CONTEXT - pos);
     if (n_prompt < 0) { fprintf(stderr, "prompt exceeds context limit\n"); return; }
     pos += n_prompt;
+
+    // Audio placeholder tokens (after the text)
+    state->audio_start = pos;
+    for (int i = 0; i < audio_count; i++)
+        state->token_ids[pos++] = AUDIO_TOKEN_ID;
 
     // Suffix: "<turn|>\n<|turn>model\n"
     const char *suffix_seg[3] = {"", "", "<turn|>\n<|turn>model\n"};

@@ -6,15 +6,24 @@ Pure C audio encoder for the Gemma 4 E2B text model. Takes a WAV file, runs it t
 a 12-layer conformer audio encoder, and injects soft tokens into the text model's
 input embeddings at `AUDIO_TOKEN_ID` (258881) positions.
 
+The official token sequence (matching `transformers` pipeline) is:
+
+```
+<bos>  <|turn>user\n  [text instruction]  N×<|audio|>  <turn|>\n<|turn>model\n
+```
+
+i.e. the text instruction comes **before** the audio soft tokens, and no BOA/EOA
+wrapping tokens are used.
+
 ```
 WAV (16kHz mono)
   → Mel spectrogram (128 bins, 10ms hop)
   → SSCP (2× Conv2d stride-2 + Linear)
   → 12× Conformer layers (FFN → Attn → LConv1d → FFN)
-  → output_proj (1024→1536, int8) + bias
+  → output_proj (1024→1536, float32) + bias
   → RMSNorm(no scale) + Linear(1536→1536, float32)
   → Soft tokens [seq_len, 1536]
-  → Replace AUDIO_TOKEN_ID positions in inputs_embeds
+  → Replace AUDIO_TOKEN_ID positions in inputs_embeds (after text tokens)
   → Text model continues as normal
 ```
 
@@ -213,10 +222,23 @@ In `transformer.c forward()`:
 - For each token position with ID == 258881, replace embedding with the
   corresponding soft token vector
 
-In `generate.c generate_audio()`:
-- Builds prompt: `<BOA>` + N×`<AUDIO_TOKEN>` + `<EOA>` + user_prompt
-- N = number of soft tokens from encoder
-- Runs prefill + decode as normal
+In `generate.c generate_audio()` — **current (incorrect) sequence:**
+```
+<|turn>user\n  <|audio>  N×<|audio|>  <audio|>  user_prompt  <turn|>\n<|turn>model\n
+ [105][2364][107] [256000]  [258881×N]  [258883]  [text...]    [106][107][105][4368][107]
+```
+
+**Correct sequence (matching `transformers` pipeline):**
+```
+<bos>  <|turn>user\n  user_prompt  N×<|audio|>  <turn|>\n<|turn>model\n
+ [2]   [105][2364][107]  [text...]    [258881×N]   [106][107][105][4368][107]
+```
+
+Key differences from the C implementation (see "Token Sequence Divergence" below):
+- `<bos>` (token 2) is **required** at position 0
+- **No** BOA (256000) or EOA (258883) tokens — transformers uses only N × 258881
+- **Order is text → audio**, not audio → text
+- The instruction text precedes the audio placeholders in the user turn
 
 ## Export (tools/exporter.py)
 
@@ -241,11 +263,15 @@ audio weights are exported as float32 regardless.
 
 ## Token IDs
 
-| Token | ID | Purpose |
-|-------|----|---------|
-| BOA | 256000 | Begin of Audio |
-| AUDIO_TOKEN | 258881 | Placeholder replaced by soft token |
-| EOA | 258883 | End of Audio |
+| Token | ID | Purpose | Used by `transformers` pipeline |
+|-------|----|---------|-------------------------------|
+| BOA `<\|audio\>` | 256000 | Begin of Audio marker | **No** — not emitted by the chat template |
+| AUDIO_TOKEN `<\|audio\|>` | 258881 | Placeholder replaced by soft token | **Yes** — the only audio token used |
+| EOA `<audio\|>` | 258883 | End of Audio marker | **No** — not emitted by the chat template |
+
+The official `transformers` pipeline (see `apply_chat_template` with `{"type": "audio"}`
+content parts) emits **only** N × token 258881 to represent the audio. No BOA/EOA wrapping.
+The model is trained on this format. See "Token Sequence Divergence" for details.
 
 ## WAV Loading
 
@@ -258,15 +284,26 @@ audio weights are exported as float32 regardless.
 
 ```bash
 # 16kHz mono WAV required
+# NOTE: The prompt is the text instruction; audio tokens are appended after it.
+# The official Gemma 4 ASR prompt:
+PROMPT="Transcribe the following speech segment in its original language. Follow these specific instructions for formatting the answer:
+* Only output the transcription, with no newlines.
+* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, and write 3 instead of three."
+
 ./run -m gemma4-E2B-int8.bin \
       -A gemma4-E2B-int8-audio.bin \
       -a /path/to/audio_16k.wav \
       -t 0 -n 128 \
-      "What did the person say in this audio?"
+      "$PROMPT"
 
 # Resample if needed
-ffmpeg -i /path/to/audio.wav -ar 16000 -ac 1 -sample_fmt f32 /tmp/audio_16k.wav
+ffmpeg -i /path/to/audio.wav -ar 16000 -ac 1 /tmp/audio_16k.wav
 ```
+
+> **Status (2026-09-05):** The `generate_audio()` function currently places
+> audio tokens **before** the prompt text and wraps them with BOA/EOA, which
+> does not match the official pipeline. The usage above shows the *intended*
+> behavior after the token sequence fix (Next Steps #12).
 
 ## Current Status
 
@@ -286,7 +323,12 @@ ffmpeg -i /path/to/audio.wav -ar 16000 -ac 1 -sample_fmt f32 /tmp/audio_16k.wav
 - [x] Audio embedding injection in text model
 - [x] No ASan errors (heap/stack overflow fixed)
 - [x] End-to-end encoder matches PyTorch (cos=1.0 at all layers + output)
-- [ ] Speech transcription quality — model is inconsistent (int8 text model issue)
+- [ ] **Token sequence in `generate_audio()`** — wrong order (audio before text)
+  and includes BOA/EOA not present in the official pipeline. **Blocking issue**
+  for end-to-end transcription. See "Token Sequence Divergence" below.
+- [ ] Speech transcription quality — int8 activation quantization of soft tokens
+  degrades quality even after token sequence fix (soft tokens are 50× larger
+  than text embeddings; per-group-64 int8 zeros 1% of values)
 
 ### Mel Spectrogram Fix (2026-09-04)
 
@@ -439,12 +481,77 @@ Despite each conformer layer matching PyTorch to ~0.1% relative error, the
 The remaining diff (~0.005) is pure float32 rounding in the final output
 storage (the API returns float32 soft tokens to the text model).
 
+### Token Sequence Divergence (2026-09-05)
+
+**Root cause of complete transcription failure** (model responds "I cannot
+process audio" or generates unrelated text). Discovered by comparing the
+token sequence built by `generate_audio()` against the sequence produced
+by the official `transformers` pipeline.
+
+**Official `transformers` pipeline token sequence** (from `apply_chat_template`):
+
+```
+<bos>  <|turn>user\n  "Transcribe the following..."  <|audio|>×N  <turn|>\n<|turn>model\n
+ [2]   [105] [2364] [107]   [text tokens 5183 17038 ...]    [258881×N]  [106][107][105][4368][107]
+```
+
+**C implementation `generate_audio()` token sequence:**
+
+```
+<|turn>user\n  <|audio>  <|audio|>×N  <audio|>  "What is in this audio?"  <turn|>\n<|turn>model\n
+ [105][2364][107] [256000]  [258881×N]  [258883]   [text tokens 5183 ...]    [106][107][105][4368][107]
+```
+
+**Three differences (in order of impact):**
+
+1. **Audio/text order is reversed** (primary cause of failure)
+   - Official: text instruction → audio tokens
+   - C code: audio tokens → text instruction
+   - The model was trained with the instruction preceding the audio, so it
+     uses the text as context for interpreting the audio soft tokens. With
+     the order reversed, the model sees 151+ audio soft tokens before any
+     instruction, producing incoherent output.
+
+2. **BOA/EOA tokens not in training data**
+   - The C code wraps audio with `<\|audio\>` (256000) and `<audio\|>` (258883).
+   - The official pipeline never emits these — it uses only N × 258881.
+   - These tokens act as unexpected noise in the attention pattern.
+
+3. **Missing `<bos>` token**
+   - The official pipeline starts with `<bos>` (token 2) from the chat template.
+   - The C code starts directly with `<\|turn\>user\n`.
+   - Less impactful than 1 and 2, but changes positional encoding alignment.
+
+**Reference (official docs):**
+- https://ai.google.dev/gemma/docs/capabilities/audio
+- Chat template: `google/gemma-4-E2B-it` → `tokenizer_config.json` → `chat_template`
+- Audio token emission: `{%- elif item.get('type') in ['audio', 'input_audio'] -%}{{- '<|audio|>' -}}`
+
+**Fix (pending):**
+Rewrite `generate_audio()` in `src/generate.c` to match the official sequence:
+
+```c
+// Correct order: BOS + turn header + text prompt + N×AUDIO + turn footer
+// 1. "<bos>" (token 2)
+// 2. "<|turn>user\n"
+// 3. user_prompt (tokenized text)
+// 4. N × AUDIO_TOKEN_ID (258881)
+// 5. "<turn|>\n<|turn>model\n"
+// No BOA/EOA tokens.
+```
+
 ### Known Issues
-- [ ] **Model-level inconsistency with audio** — the int8 text model sometimes
-  acknowledges the audio (e.g. "[Music]") and sometimes says it can't hear
-  anything. This is a text-model quantization/alignment issue, not an audio
-  encoder bug. The encoder output is verified correct (cos=1.0 vs PyTorch).
-  May improve with a higher-precision text model (int4 QAT or float16).
+- [ ] **Token sequence mismatch** — `generate_audio()` uses the wrong token
+  order (audio before text) and includes BOA/EOA tokens that the official
+  pipeline never emits. This is the **primary cause** of the model's failure
+  to transcribe. See "Token Sequence Divergence" above.
+- [ ] **Int8 activation quantization of soft tokens** — the audio soft tokens
+  have ~50× the dynamic range of regular text embeddings (abs_max 31.4 vs 0.63).
+  Per-group-64 int8 quantization (scale = max_abs/127) zeros 1.06% of values
+  and introduces ~3.4% mean relative error that compounds through 28 layers.
+  The `transformers` pipeline runs the text model in float32/bfloat16 where
+  this issue doesn't exist. May require float32 bypass for audio token rows,
+  or a QAT model calibrated for the wider activation range.
 
 ### Next Steps
 1. ~~Fix mel spectrogram to match PyTorch exactly~~ ✓ (done 2026-09-04)
@@ -460,12 +567,20 @@ storage (the API returns float32 soft tokens to the text model).
 10. ~~Fix GLU activation in LConv1d~~ ✓ (done 2026-09-05: `silu(a)*b` → `a*sigmoid(b)`)
 11. ~~Switch conformer loop to float64 intermediates~~ ✓ (done 2026-09-05:
     cos=1.0 at all 12 layers + output, vs PyTorch)
-12. **Optimize** — the float64 conformer is ~5× slower than float32. Options:
+12. **Fix token sequence in `generate_audio()`** (2026-09-05) — align with
+    official pipeline: `<bos>` + `<\|turn\>user\n` + **text first** + N×258881
+    + `<turn\|>\n<\|turn\>model\n`. Remove BOA/EOA tokens. This is the
+    **blocking issue** for end-to-end transcription.
+13. **Address int8 quantization of audio soft tokens** — options:
+    - Bypass `quantize_dispatch` for audio token rows (use float32 matmul path)
+    - Use QAT int4 model trained with audio (if available)
+    - Scale soft tokens to match text embedding range before injection
+14. **Optimize** — the float64 conformer is ~5× slower than float32. Options:
     - Use float32 for the first N layers (where error is still small) and
       float64 only for the last M layers
     - Use float32 with Kahan summation or pairwise summation in matmul
     - Profile to find which layers are most sensitive and only use float64 there
-13. **Test with actual speech audio** to validate end-to-end transcription
+15. **Test with actual speech audio** to validate end-to-end transcription
     quality (current test audio is music)
 
 ## Debug Tools
@@ -522,7 +637,7 @@ python3 tools/reference_encoder.py /tmp/sscp_ref.pt
 #define AUDIO_PAST_HORIZON 12
 #define AUDIO_CONTEXT    24
 #define AUDIO_CONV_KERNEL 5
-#define AUDIO_TOKEN_ID   258881
-#define AUDIO_BOA_ID     256000
-#define AUDIO_EOA_ID     258883
+#define AUDIO_TOKEN_ID   258881   // <|audio|> — the only audio token used by transformers
+#define AUDIO_BOA_ID     256000   // <|audio>  — NOT used by the official pipeline (unused)
+#define AUDIO_EOA_ID     258883   // <audio|>  — NOT used by the official pipeline (unused)
 ```
