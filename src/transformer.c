@@ -193,6 +193,19 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
     float scores[(size_t)start_pos + token_count]; // Each thread needs private scratch large enough for every visible key.
     embedding_dispatch(model, state->residual, &model->weights.embed, tokens, token_count, sqrtf((float)HIDDEN_SIZE));
 
+    // Replace audio placeholder embeddings with pre-computed soft tokens.
+    if (state->audio_embeds && state->audio_count > 0) {
+        for (size_t i = 0; i < token_count; i++) {
+            int abs_pos = start_pos + (int)i;
+            if (tokens[i] == AUDIO_TOKEN_ID && abs_pos >= state->audio_start && abs_pos < state->audio_start + state->audio_count) {
+                int embed_idx = abs_pos - state->audio_start;
+                memcpy(state->residual + i * HIDDEN_SIZE,
+                       state->audio_embeds + (size_t)embed_idx * HIDDEN_SIZE,
+                       HIDDEN_SIZE * sizeof(float));
+            }
+        }
+    }
+
     // Build the token-conditioned input that each transformer layer will receive.
     quantize_dispatch(model, state->quantized, state->activation_scales, state->residual, token_count, HIDDEN_SIZE);
     matmul_dispatch(model, state->per_layer_inputs, state->quantized, state->activation_scales, &model->weights.per_layer_model_projection, token_count);

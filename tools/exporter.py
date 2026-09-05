@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+from math import inf
 from pathlib import Path
 import struct
 import tempfile
@@ -400,14 +401,357 @@ def export(checkpoint_path, output_path, quant_mode=8):
     print(f"Done {output_path} ({file_size / 1024**3:.2f} GiB): {text_count} text tensors")
 
 
+# ----------------------------------------------------------------------------
+# Audio export
+
+AUDIO_MAGIC = b"MOGA"
+AUDIO_LAYERS = 12
+AUDIO_HIDDEN = 1024
+AUDIO_HEADS = 8
+AUDIO_HEAD_DIM = 128
+AUDIO_FFN = 4096
+AUDIO_OUTPUT = 1536
+AUDIO_MEL_BINS = 128
+AUDIO_FFT_LEN = 512
+AUDIO_FRAME_LEN = 320
+AUDIO_HOP_LEN = 160
+AUDIO_CONTEXT = 24  # chunk(12) + past(12) + future(0)
+AUDIO_NUM_POSITIONS = AUDIO_CONTEXT // 2 + 1  # 13
+
+
+def compute_hann_window(n):
+    """Periodic Hann window: w[k] = 0.5 - 0.5 * cos(2*pi*k / n)"""
+    return (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)).astype(np.float32)
+
+
+def compute_mel_filterbank(num_fft_bins, num_mels, min_freq, max_freq, sr, mel_scale="htk"):
+    """HTK mel filterbank matching transformers' mel_filter_bank.
+
+    Uses the same slope-based construction as transformers.audio_utils._create_triangular_filter_bank:
+    fft_freqs = linspace(0, sr/2, num_fft_bins)
+    triangular slopes computed in frequency space.
+    """
+    def hz_to_mel(f):
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+    def mel_to_hz(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    # Center points of the triangular mel filters (edges for num_mels triangles)
+    mel_min = hz_to_mel(min_freq)
+    mel_max = hz_to_mel(max_freq)
+    mel_freqs = np.linspace(mel_min, mel_max, num_mels + 2)
+    filter_freqs = mel_to_hz(mel_freqs)  # [num_mels + 2] in Hz
+
+    # Frequencies of FFT bins in Hz
+    fft_freqs = np.linspace(0, sr // 2, num_fft_bins)
+
+    # Triangular filter construction (same as transformers)
+    filter_diff = np.diff(filter_freqs)  # [num_mels]
+    slopes = np.expand_dims(filter_freqs, 0) - np.expand_dims(fft_freqs, 1)  # [num_fft_bins, num_mels+2]
+    down_slopes = -slopes[:, :-2] / filter_diff[:-1]  # [num_fft_bins, num_mels]
+    up_slopes = slopes[:, 2:] / filter_diff[1:]  # [num_fft_bins, num_mels]
+    filters = np.maximum(0.0, np.minimum(down_slopes, up_slopes)).astype(np.float32)
+    return filters
+
+
+def tensor_flat(weights, path):
+    """Read an N-D tensor and store it as a flat float32 synthetic."""
+    arr = weights.get_tensor(path).float().numpy().ravel().astype(np.float32)
+    return tensor(weights, None, synthetic=arr)
+
+
+def validate_audio_config(config):
+    audio = config.get("audio_config")
+    if audio is None:
+        raise ValueError("checkpoint has no audio_config")
+    if audio["hidden_size"] != AUDIO_HIDDEN:
+        raise ValueError(f"expected audio hidden_size={AUDIO_HIDDEN}, got {audio['hidden_size']}")
+    if audio["num_hidden_layers"] != AUDIO_LAYERS:
+        raise ValueError(f"expected audio num_hidden_layers={AUDIO_LAYERS}, got {audio['num_hidden_layers']}")
+    return audio
+
+
+def _get_clip(weights, prefix):
+    """Read 4 clip-bound floats from checkpoint."""
+    return np.array([
+        weights.get_tensor(prefix + "input_min").item(),
+        weights.get_tensor(prefix + "input_max").item(),
+        weights.get_tensor(prefix + "output_min").item(),
+        weights.get_tensor(prefix + "output_max").item(),
+    ], dtype=np.float32)
+
+
+def export_audio(checkpoint_path, output_path, quant_mode=8):
+    """Export audio encoder to a binary that is a raw AudioModel struct + tensor data."""
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config = read_json(checkpoint_path, "config.json")
+    validate_audio_config(config)
+    for preproc_name in ["audio_preprocessor_config.json", "preprocessor_config.json"]:
+        preproc_path = checkpoint_path / preproc_name
+        if preproc_path.is_file():
+            preproc = read_json(checkpoint_path, preproc_name)
+            if "per_bin_mean" in preproc:
+                config.setdefault("audio_config", {})["per_bin_mean"] = preproc["per_bin_mean"]
+            if "per_bin_stddev" in preproc:
+                config.setdefault("audio_config", {})["per_bin_stddev"] = preproc["per_bin_stddev"]
+            break
+    audio_cfg = config.get("audio_config", config)
+    boa_token_id = config.get("boa_token_id", 256000)
+    eoa_token_id = config.get("eoa_token_index", config.get("eoa_token_id", 258883))
+    audio_token_id = config.get("audio_token_id", 258881)
+
+    # Struct layout constants (verified against C sizeof/offsetof)
+    STRUCT_SIZE = 147264
+    OFF_MAGIC = 0
+    OFF_QUANT = 4
+    OFF_VERSION = 8
+    OFF_HANN = 12          # 512 floats
+    OFF_MEL = 2060         # 257*128 floats
+    OFF_MEAN = 133644      # 128 floats
+    OFF_STD = 134156       # 128 floats
+    OFF_SSCP = 134672      # AudioSSCP (192 bytes = 6 slots)
+    OFF_LAYERS = 134864    # 12 x AudioLayer (1024 bytes = 32 slots each)
+    OFF_OUT_PROJ = 147152  # Tensor (32 bytes)
+    OFF_OUT_BIAS = 147184  # Tensor (32 bytes)
+    OFF_EMBED_PROJ = 147216 # Tensor (32 bytes)
+    OFF_BOA = 147248
+    OFF_EOA = 147252
+    OFF_AUDIO_TOK = 147256
+
+    # Each Tensor is 32 bytes: <qq4i> (data_u64, scales_u64, shape[4]_i32)
+    # Each ClippableLinear is 64 bytes: Tensor(32) + 4*float(16) + pad(16)
+    # The 32-byte stepper visits: slot 0 = Tensor, slot 1 = clip floats + pad
+
+    def tensor_entry(data_off, scales_off, shape):
+        """Pack a 32-byte Tensor: data, scales, shape[4]."""
+        s = list(shape) + [0] * (4 - len(shape))
+        return struct.pack("<qq4i", data_off, scales_off, *s)
+
+    def clip_entry(bounds):
+        """Pack 16 bytes: 4 clip floats + 16 pad (the part after Tensor in ClippableLinear)."""
+        return struct.pack("<4f16x", *bounds)
+
+    with safetensors.safe_open(checkpoint_path / "model.safetensors", framework="pt") as weights:
+        ap = "model.audio_tower."
+
+        # Phase 1: collect all tensor data (quantize now)
+        # Returns list of (shape, data_bytes, scales_bytes) for real tensors
+        tensor_blobs = []  # (shape, packed_data, scales)
+
+        def add_linear(path, clip_prefix=None):
+            """Add a 2D int8 linear. Returns (shape, data, scales)."""
+            arr = np.asarray(read_weight(weights, path), dtype="<f4", order="C")
+            values, scales = quantize(arr, quant_mode)
+            rows, cols = arr.shape
+            groups = cols // (64 if quant_mode == 8 else 32)
+            blocks = rows // BLOCK_ROWS
+            values_packed = values.reshape(rows, cols).reshape(
+                blocks, BLOCK_ROWS, groups, GROUP_SIZE // BLOCK_WIDTH, BLOCK_WIDTH
+            ).transpose(0, 2, 3, 1, 4).reshape(-1)
+            tensor_blobs.append(((rows, cols), values_packed.tobytes(), scales.tobytes()))
+            return (rows, cols), values_packed.size, scales.nbytes
+
+        def add_float(path, shape=None):
+            """Add a float32 tensor (1D or N-D). Returns (shape, size)."""
+            arr = np.asarray(read_weight(weights, path), dtype="<f4", order="C")
+            if shape is None:
+                shape = arr.shape
+            flat = arr.ravel().astype("<f4")
+            tensor_blobs.append((tuple(shape), flat.tobytes(), b""))
+            return tuple(shape), flat.size * 4
+
+        # Phase 2: build the struct as a bytearray
+        buf = bytearray(STRUCT_SIZE)
+
+        # Header
+        buf[OFF_MAGIC:OFF_MAGIC+4] = b"MOGA"
+        buf[OFF_QUANT:OFF_QUANT+4] = struct.pack("<i", quant_mode)
+        buf[OFF_VERSION:OFF_VERSION+4] = struct.pack("<i", 1)
+
+        # Inlined tables
+        # C code applies hann[i] for i < AUDIO_FRAME_LEN (320), rest is zero-pad
+        hann_320 = compute_hann_window(320).astype("<f4")
+        hann_512 = np.zeros(512, dtype=np.float32)
+        hann_512[:320] = hann_320
+        buf[OFF_HANN:OFF_HANN+512*4] = hann_512.tobytes()
+        mel_fb = compute_mel_filterbank(257, AUDIO_MEL_BINS, 0, 8000, 16000).astype("<f4")
+        buf[OFF_MEL:OFF_MEL+257*128*4] = mel_fb.reshape(-1).tobytes()
+        per_bin_mean = audio_cfg.get("per_bin_mean", [0.0]*AUDIO_MEL_BINS)
+        per_bin_stddev = audio_cfg.get("per_bin_stddev", [1.0]*AUDIO_MEL_BINS)
+        buf[OFF_MEAN:OFF_MEAN+128*4] = np.array(per_bin_mean, dtype="<f4").tobytes()
+        buf[OFF_STD:OFF_STD+128*4] = np.array(per_bin_stddev, dtype="<f4").tobytes()
+
+        # We'll fill in Tensor fields once we know data offsets.
+        # For now, record where each Tensor goes in the struct.
+        tensor_offsets = []  # list of (struct_offset, blob_index, is_clippable, clip_prefix)
+
+        def sscp_off(field_off):
+            return OFF_SSCP + field_off
+
+        def layer_off(layer_idx, field_off):
+            return OFF_LAYERS + layer_idx * 1024 + field_off
+
+        # --- SSCP (6 slots) ---
+        # slot 0: conv0_weight [128,1,3,3] float
+        shape, sz = add_float(ap + "subsample_conv_projection.layer0.conv.weight", (128,1,3,3))
+        tensor_offsets.append((sscp_off(0), len(tensor_blobs)-1, False, None))
+        # slot 1: norm0_weight [128] float
+        shape, sz = add_float(ap + "subsample_conv_projection.layer0.norm.weight", (128,))
+        tensor_offsets.append((sscp_off(32), len(tensor_blobs)-1, False, None))
+        # slot 2: conv1_weight [32,128,3,3] float
+        shape, sz = add_float(ap + "subsample_conv_projection.layer1.conv.weight", (32,128,3,3))
+        tensor_offsets.append((sscp_off(64), len(tensor_blobs)-1, False, None))
+        # slot 3: norm1_weight [32] float
+        shape, sz = add_float(ap + "subsample_conv_projection.layer1.norm.weight", (32,))
+        tensor_offsets.append((sscp_off(96), len(tensor_blobs)-1, False, None))
+        # slot 4: input_proj [1024,1024] float32 (int8 too lossy for skewed ReLU input)
+        shape, sz = add_float(ap + "subsample_conv_projection.input_proj_linear.weight")
+        tensor_offsets.append((sscp_off(128), len(tensor_blobs)-1, False, None))
+        # slot 5: clip bounds (unused for float32)
+        buf[sscp_off(176):sscp_off(192)] = struct.pack("<4f", -inf, inf, -inf, inf)
+
+        # --- 12 layers ---
+        for i in range(AUDIO_LAYERS):
+            lp = ap + f"layers.{i}."
+            lo = layer_off(i, 0)
+
+            # ffn1 (6 slots: 0,32,64,96,128,160) — float32 for accuracy
+            shape, sz = add_float(lp + "feed_forward1.ffw_layer_1.linear.weight")
+            tensor_offsets.append((lo + 0, len(tensor_blobs)-1, False, None))
+            buf[lo+48:lo+64] = struct.pack("<4f", *_get_clip(weights, lp+"feed_forward1.ffw_layer_1."))
+            shape, sz = add_float(lp + "feed_forward1.ffw_layer_2.linear.weight")
+            tensor_offsets.append((lo + 64, len(tensor_blobs)-1, False, None))
+            buf[lo+112:lo+128] = struct.pack("<4f", *_get_clip(weights, lp+"feed_forward1.ffw_layer_2."))
+            shape, sz = add_float(lp + "feed_forward1.pre_layer_norm.weight", (1024,))
+            tensor_offsets.append((lo + 128, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "feed_forward1.post_layer_norm.weight", (1024,))
+            tensor_offsets.append((lo + 160, len(tensor_blobs)-1, False, None))
+
+            # attn (10 slots: 192-447) — float32 for accuracy
+            for j, pn in enumerate(["q_proj", "k_proj", "v_proj", "post"]):
+                shape, sz = add_float(lp + f"self_attn.{pn}.linear.weight")
+                tensor_offsets.append((lo + 192 + j*64, len(tensor_blobs)-1, False, None))
+                buf[lo+192+j*64+48 : lo+192+j*64+64] = struct.pack(
+                    "<4f", *_get_clip(weights, lp+f"self_attn.{pn}."))
+            shape, sz = add_float(lp + "self_attn.relative_k_proj.weight", (1024,1024))
+            tensor_offsets.append((lo + 448, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "self_attn.per_dim_scale", (128,))
+            tensor_offsets.append((lo + 480, len(tensor_blobs)-1, False, None))
+
+            # lconv (7 slots: 512-735) — float32 for accuracy
+            shape, sz = add_float(lp + "lconv1d.linear_start.linear.weight")
+            tensor_offsets.append((lo + 512, len(tensor_blobs)-1, False, None))
+            buf[lo+512+48:lo+512+64] = struct.pack("<4f", *_get_clip(weights, lp+"lconv1d.linear_start."))
+            shape, sz = add_float(lp + "lconv1d.linear_end.linear.weight")
+            tensor_offsets.append((lo + 576, len(tensor_blobs)-1, False, None))
+            buf[lo+576+48:lo+576+64] = struct.pack("<4f", *_get_clip(weights, lp+"lconv1d.linear_end."))
+            shape, sz = add_float(lp + "lconv1d.depthwise_conv1d.weight", (1024,1,5))
+            tensor_offsets.append((lo + 640, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "lconv1d.pre_layer_norm.weight", (1024,))
+            tensor_offsets.append((lo + 672, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "lconv1d.conv_norm.weight", (1024,))
+            tensor_offsets.append((lo + 704, len(tensor_blobs)-1, False, None))
+
+            # ffn2 (6 slots: 736-927) — float32 for accuracy
+            shape, sz = add_float(lp + "feed_forward2.ffw_layer_1.linear.weight")
+            tensor_offsets.append((lo + 736, len(tensor_blobs)-1, False, None))
+            buf[lo+736+48:lo+736+64] = struct.pack("<4f", *_get_clip(weights, lp+"feed_forward2.ffw_layer_1."))
+            shape, sz = add_float(lp + "feed_forward2.ffw_layer_2.linear.weight")
+            tensor_offsets.append((lo + 800, len(tensor_blobs)-1, False, None))
+            buf[lo+800+48:lo+800+64] = struct.pack("<4f", *_get_clip(weights, lp+"feed_forward2.ffw_layer_2."))
+            shape, sz = add_float(lp + "feed_forward2.pre_layer_norm.weight", (1024,))
+            tensor_offsets.append((lo + 864, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "feed_forward2.post_layer_norm.weight", (1024,))
+            tensor_offsets.append((lo + 896, len(tensor_blobs)-1, False, None))
+
+            # layer norms (3 slots: 928,960,992)
+            shape, sz = add_float(lp + "norm_pre_attn.weight", (1024,))
+            tensor_offsets.append((lo + 928, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "norm_post_attn.weight", (1024,))
+            tensor_offsets.append((lo + 960, len(tensor_blobs)-1, False, None))
+            shape, sz = add_float(lp + "norm_out.weight", (1024,))
+            tensor_offsets.append((lo + 992, len(tensor_blobs)-1, False, None))
+
+        # --- Output projection (float32) ---
+        shape, sz = add_float(ap + "output_proj.weight")
+        tensor_offsets.append((OFF_OUT_PROJ, len(tensor_blobs)-1, False, None))
+        shape, sz = add_float(ap + "output_proj.bias", (1536,))
+        tensor_offsets.append((OFF_OUT_BIAS, len(tensor_blobs)-1, False, None))
+
+        # --- Embed projection ---
+        shape, sz = add_float("model.embed_audio.embedding_projection.weight", (1536,1536))
+        tensor_offsets.append((OFF_EMBED_PROJ, len(tensor_blobs)-1, False, None))
+
+        # Token IDs
+        buf[OFF_BOA:OFF_BOA+4] = struct.pack("<i", boa_token_id)
+        buf[OFF_EOA:OFF_EOA+4] = struct.pack("<i", eoa_token_id)
+        buf[OFF_AUDIO_TOK:OFF_AUDIO_TOK+4] = struct.pack("<i", audio_token_id)
+
+        # Phase 3: calculate data offsets and patch Tensor fields
+        data_cursor = STRUCT_SIZE
+        for blob_shape, data_bytes, scales_bytes in tensor_blobs:
+            data_cursor = align64(data_cursor)
+
+        for struct_off, blob_idx, _, _ in tensor_offsets:
+            shape, data_bytes, scales_bytes = tensor_blobs[blob_idx]
+            data_off = align64(data_cursor)
+            data_cursor = align64(data_off + len(data_bytes))
+            scales_off = 0
+            if scales_bytes:
+                scales_off = align64(data_cursor)
+                data_cursor = align64(scales_off + len(scales_bytes))
+            buf[struct_off:struct_off+32] = tensor_entry(data_off, scales_off, shape)
+
+        file_size = align64(data_cursor)
+
+        # Phase 4: write the file
+        with tempfile.TemporaryDirectory(prefix=f".{output_path.name}.", dir=output_path.parent) as directory:
+            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as output:
+                temp_path = Path(output.name)
+                output.truncate(file_size)
+
+                # Struct
+                output.seek(0)
+                output.write(bytes(buf))
+
+                # Tensor data
+                data_cursor = STRUCT_SIZE
+                for blob_shape, data_bytes, scales_bytes in tensor_blobs:
+                    data_off = align64(data_cursor)
+                    output.seek(data_off)
+                    output.write(data_bytes)
+                    data_cursor = align64(data_off + len(data_bytes))
+                    if scales_bytes:
+                        scales_off = align64(data_cursor)
+                        output.seek(scales_off)
+                        output.write(scales_bytes)
+                        data_cursor = align64(scales_off + len(scales_bytes))
+
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_path, output_path)
+
+    print(f"Done {output_path} ({file_size / 1024**2:.1f} MiB): {len(tensor_blobs)} tensors")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("-o", "--out", type=Path, required=True)
+    parser.add_argument("-o", "--out", type=Path, default=None)
     parser.add_argument("--quant", choices=("int8", "int4"), default="int8",
                         help="weight quantization mode (default: int8)")
+    parser.add_argument("--audio-out", type=Path, default=None,
+                        help="export audio encoder weights to a separate file")
     args = parser.parse_args()
-    export(args.checkpoint, args.out, 4 if args.quant == "int4" else 8)
+    if not args.out and not args.audio_out:
+        parser.error("at least one of -o/--out or --audio-out is required")
+    if args.out:
+        export(args.checkpoint, args.out, 4 if args.quant == "int4" else 8)
+    if args.audio_out:
+        export_audio(args.checkpoint, args.audio_out, 4 if args.quant == "int4" else 8)
 
 
 if __name__ == "__main__":

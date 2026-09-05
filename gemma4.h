@@ -116,6 +116,10 @@ typedef struct {
     float sliding_cache[3][4][2 * (SLIDING_WINDOW + BATCH_SIZE) * 256]; // Keeps the previous window and current batch for twelve sliding KV caches.
     float full_cache[3][2 * MAX_CONTEXT * 512];                         // Holds the complete context for three 512-wide full-attention KV caches.
     int token_ids[MAX_CONTEXT];                                         // Holds the tokenized prompt before prefill.
+    // Audio support
+    float *audio_embeds;                                                // Pre-computed audio soft tokens [count, HIDDEN_SIZE]; NULL if no audio.
+    int audio_start;                                                    // Token position where audio begins (-1 = none).
+    int audio_count;                                                    // Number of audio soft tokens.
 } InferenceState;
 
 typedef struct {
@@ -225,6 +229,22 @@ void seed_rng(void);
 void prefill(Model *model, InferenceState *state, const int *tokens, int token_count, int dump_logits);
 void generate(Model *model, InferenceState *state, const char *prompt,
               int max_new_tokens, float temperature, int dump_logits, int stats);
+void generate_audio(Model *model, InferenceState *state, const char *audio_path,
+                    const char *prompt, int max_new_tokens, float temperature, int stats);
 void benchmark(Model *model, InferenceState *state, int prefill_tokens, int generated_tokens);
+
+// ----------------------------------------------------------------------------
+// audio.c
+
+#define AUDIO_TOKEN_ID 258881
+#define AUDIO_BOA_ID   256000
+#define AUDIO_EOA_ID   258883
+
+typedef struct AudioModel AudioModel;
+AudioModel *audio_load(const char *path);
+void audio_unload(AudioModel *model, size_t size);
+float *wav_load(const char *path, int *out_num_samples, int *out_sample_rate);
+// Loads WAV, runs encoder, stores soft tokens in state->audio_embeds.
+void audio_encode_into(AudioModel *audio, InferenceState *state, const char *wav_path);
 
 #endif // GEMMA4_H

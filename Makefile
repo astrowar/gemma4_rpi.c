@@ -33,17 +33,17 @@ else
   ARCH = pure
 endif
 
-SRCS = src/tokenizer.c src/model.c $(KERNEL_SRC) src/transformer.c src/generate.c src/main.c
+SRCS = src/tokenizer.c src/model.c $(KERNEL_SRC) src/transformer.c src/generate.c src/audio.c src/main.c
 
 .PHONY: all run win64 test test-neon profile clean info
 
 all: run
 
-run: $(SRCS) gemma4.h
+run: $(SRCS) gemma4.h audio.h
 	@echo "Building [$(ARCH)] kernels: $(KERNEL_SRC)"
 	$(CC) $(CFLAGS) $(SRCS) -o run $(LDFLAGS)
 
-win64: $(SRCS) src/win.c src/win.h gemma4.h
+win64: $(SRCS) src/win.c src/win.h gemma4.h audio.h
 	$(WINCC) $(CFLAGS) -static -D_WIN32 $(SRCS) src/win.c -o run.exe $(LDFLAGS) -lshell32
 
 # Correctness test: NEON matmul vs scalar reference (aarch64 only).

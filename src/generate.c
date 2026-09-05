@@ -142,3 +142,78 @@ void benchmark(Model *model, InferenceState *state, int prefill_tokens, int gene
         printf("tg%d@d%d %.2f tok/s\n", generated_tokens, prefill_tokens, (double)generated_tokens / (time_seconds() - start));
     }
 }
+
+void generate_audio(Model *model, InferenceState *state, const char *audio_path,
+                    const char *prompt, int max_new_tokens, float temperature, int stats) {
+    (void)audio_path;  // Audio already encoded into state by caller.
+    Tokenizer *tokenizer = &model->tokenizer;
+    int audio_count = state->audio_count;
+    if (audio_count <= 0) {
+        fprintf(stderr, "no audio tokens to process\n");
+        return;
+    }
+
+    // Build token sequence: prefix + boa + [audio]*N + eoa + prompt + suffix
+    int pos = 0;
+
+    // Prefix: "<|turn>user\n"
+    const char *prefix_seg[3] = {"<|turn>user\n", "", ""};
+    int n_prefix = tokenize(tokenizer, prefix_seg, state->token_ids + pos, MAX_CONTEXT - pos);
+    if (n_prefix < 0) { fprintf(stderr, "prefix too long\n"); return; }
+    pos += n_prefix;
+
+    // BOA token
+    state->token_ids[pos++] = AUDIO_BOA_ID;
+
+    // Audio placeholder tokens
+    state->audio_start = pos;
+    for (int i = 0; i < audio_count; i++)
+        state->token_ids[pos++] = AUDIO_TOKEN_ID;
+
+    // EOA token
+    state->token_ids[pos++] = AUDIO_EOA_ID;
+
+    // User prompt
+    const char *prompt_seg[3] = {"", prompt, ""};
+    int n_prompt = tokenize(tokenizer, prompt_seg, state->token_ids + pos, MAX_CONTEXT - pos);
+    if (n_prompt < 0) { fprintf(stderr, "prompt exceeds context limit\n"); return; }
+    pos += n_prompt;
+
+    // Suffix: "<turn|>\n<|turn>model\n"
+    const char *suffix_seg[3] = {"", "", "<turn|>\n<|turn>model\n"};
+    int n_suffix = tokenize(tokenizer, suffix_seg, state->token_ids + pos, MAX_CONTEXT - pos);
+    if (n_suffix < 0) { fprintf(stderr, "context overflow\n"); return; }
+    pos += n_suffix;
+
+    int prompt_tokens = pos;
+
+    // Prefill
+    double t_prefill_start = time_seconds();
+    prefill(model, state, state->token_ids, prompt_tokens, 0);
+    double t_prefill_end = time_seconds();
+    fprintf(stderr, "[audio] prefill: %d tokens (%d audio) in %.2fs\n",
+            prompt_tokens, audio_count, t_prefill_end - t_prefill_start);
+
+    // Decode
+    int end = prompt_tokens + max_new_tokens;
+    if (end > MAX_CONTEXT) end = MAX_CONTEXT;
+    int generated = 0;
+    double t_decode_start = time_seconds();
+    for (int position = prompt_tokens; position < end; position++) {
+        int next_token = sample(logits(model, state, (position == prompt_tokens) ? (prompt_tokens - 1) % BATCH_SIZE : 0), VOCAB_SIZE, temperature);
+        if (next_token == 1 || next_token == 106) break;
+        fputs(token_text(tokenizer, next_token), stdout);
+        fflush(stdout);
+        forward(model, state, &next_token, 1, position);
+        generated++;
+    }
+    double t_decode_end = time_seconds();
+    putchar('\n');
+
+    if (stats) {
+        double decode_time = t_decode_end - t_decode_start;
+        fprintf(stderr, "[audio] decode: %d tokens in %.2fs (%.2f tok/s)\n",
+                generated, decode_time,
+                decode_time > 0 ? (double)generated / decode_time : 0.0);
+    }
+}

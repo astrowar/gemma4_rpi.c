@@ -1,6 +1,8 @@
 /gemma4-E2B-int8.bin
 /gemma4-E2B-int4.bin
+/gemma4-E2B-int8-audio.bin
 /run
+/run_asan
 /run.exe
 /run_profile
 /test_neon_matmul

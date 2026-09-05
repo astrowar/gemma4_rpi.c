@@ -1,11 +1,14 @@
 #include "gemma4.h"
+#include "audio.h"
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
     argv_utf8(&argc, &argv);
 #endif
     const char *model_path = "gemma4-E2B-int8.bin";
-    const char *prompt = "Why is the sky blue?";
+    const char *prompt = "What is in this audio?";
+    const char *audio_wav = NULL;
+    const char *audio_model_path = "gemma4-E2B-int8-audio.bin";
     float temperature = 1.0f;
     int max_new_tokens = 1024;
     int benchmark_mode = 0, dump_logits = 0, stats = 0, prefill_tokens = 0, generated_tokens = 256;
@@ -14,6 +17,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) temperature = atof(argv[++i]);
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_new_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-a") && i + 1 < argc) audio_wav = argv[++i];
+        else if (!strcmp(argv[i], "-A") && i + 1 < argc) audio_model_path = argv[++i];
         else if (!strcmp(argv[i], "--bench")) {
             benchmark_mode = 1;
             if (i + 1 < argc) prefill_tokens = atoi(argv[++i]);
@@ -55,8 +60,31 @@ int main(int argc, char **argv) {
 
     seed_rng();
     omp_init();
-    if (benchmark_mode) benchmark(model, state, prefill_tokens, generated_tokens);
-    else generate(model, state, prompt, max_new_tokens, temperature, dump_logits, stats);
+    if (benchmark_mode) {
+        benchmark(model, state, prefill_tokens, generated_tokens);
+    } else if (audio_wav) {
+        // Load audio model and encode
+        fprintf(stderr, "Loading audio model: %s\n", audio_model_path);
+        int afd = open(audio_model_path, O_RDONLY);
+        struct stat ast;
+        if (afd < 0 || fstat(afd, &ast)) { perror(audio_model_path); return 1; }
+        AudioModel *amodeL = audio_load(audio_model_path);
+        close(afd);
+        if (!amodeL) { fprintf(stderr, "failed to load audio model\n"); return 1; }
+        fprintf(stderr, "Audio model loaded: %.1f MB\n", (double)ast.st_size / (1024.0 * 1024.0));
+
+        audio_encode_into(amodeL, state, audio_wav);
+        if (state->audio_count <= 0) {
+            fprintf(stderr, "audio encoding failed\n");
+            return 1;
+        }
+        generate_audio(model, state, audio_wav, prompt, max_new_tokens, temperature, stats);
+
+        audio_unload(amodeL, (size_t)ast.st_size);
+    } else {
+        generate(model, state, prompt, max_new_tokens, temperature, dump_logits, stats);
+    }
+    free(state->audio_embeds);
     free(state);
     munmap(model, (size_t)st.st_size);
     return 0;
