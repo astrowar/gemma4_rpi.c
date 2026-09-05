@@ -208,16 +208,22 @@ def main():
             # Norm out
             hs = rms_norm(hs, f.get_tensor(lp + 'norm_out.weight').float())
             print(f'Layer {i}: mean={hs.mean():.4f}, std={hs.std():.4f}, max={hs.abs().max():.4f}')
-            if i == 0:
-                torch.save(hs, '/tmp/layer0_ref.pt')
+            torch.save(hs, f'/tmp/layer{i}_ref.pt')
 
         # Output projection (has bias)
         out_w = f.get_tensor(ap + 'output_proj.weight').float()
         out_b = f.get_tensor(ap + 'output_proj.bias').float()
         output = F.linear(hs, out_w, out_b)
-        print(f'Output: {output.shape}, mean={output.mean():.4f}, std={output.std():.4f}')
+        print(f'output_proj: {output.shape}, mean={output.mean():.4f}, std={output.std():.4f}')
+        torch.save(output, '/tmp/output_proj_ref.pt')
 
-    torch.save(output, '/tmp/encoder_ref.pt')
+        # Multimodal embedder: RMSNorm(no scale) + Linear(1536->1536)
+        embed_w = f.get_tensor('model.embed_audio.embedding_projection.weight').float()
+        normed = rms_norm(output, torch.ones(OUT_DIM, dtype=torch.float32))
+        final = F.linear(normed, embed_w)
+        print(f'embed_proj: {final.shape}, mean={final.mean():.4f}, std={final.std():.4f}')
+
+    torch.save(final, '/tmp/encoder_ref.pt')
     print(f'Saved /tmp/encoder_ref.pt')
 
 

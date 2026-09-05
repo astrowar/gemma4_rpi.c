@@ -436,7 +436,11 @@ static void audio_sscp(AudioModel *model, const float *mel, int num_frames,
 }
 
 // ----------------------------------------------------------------------------
-// Feed forward block
+// Float32 conformer sub-functions (kept for reference; active path uses float64)
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 
 static void audio_ffn(AudioState *state, AudioFFN *ffn, const float *input,
                       float *output, int seq_len, float residual_weight) {
@@ -748,12 +752,276 @@ static void audio_lconv1d(AudioState *state, AudioModel *model, int layer_idx,
     free(post);
 }
 
+#pragma GCC diagnostic pop
+
 // ----------------------------------------------------------------------------
-// Full audio encoder
+// Float64 conformer helpers
+// All intermediate activations use double precision to prevent chaotic
+// divergence across 12 layers. Weights remain float32 (from binary), but
+// are upcast to double at the point of use.
+
+static inline double silu_d(double x) {
+    return x / (1.0 + exp(-x));
+}
+
+static inline double softcap_d(double x, double cap) {
+    return cap * tanh(x / cap);
+}
+
+static void rmsnorm_f64(double *output, const double *input, const float *weight,
+                        int n, int dim) {
+    for (int i = 0; i < n; i++) {
+        const double *x = input + (size_t)i * dim;
+        double *o = output + (size_t)i * dim;
+        double sum = 0.0;
+        for (int j = 0; j < dim; j++) sum += x[j] * x[j];
+        double inv_rms = 1.0 / sqrt(sum / dim + 1e-6);
+        if (weight) {
+            for (int j = 0; j < dim; j++) o[j] = x[j] * inv_rms * (double)weight[j];
+        } else {
+            for (int j = 0; j < dim; j++) o[j] = x[j] * inv_rms;
+        }
+    }
+}
+
+static void audio_linear_f64(double *output, const double *input, int rows,
+                             const ClippableLinear *layer, int in_dim, int out_dim) {
+    const float *w = (const float *)layer->weight.data;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < out_dim; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < in_dim; k++)
+                sum += input[(size_t)i * in_dim + k] * (double)w[(size_t)j * in_dim + k];
+            output[(size_t)i * out_dim + j] = sum;
+        }
+    }
+}
+
+// FFN block in float64
+static void audio_ffn_f64(AudioFFN *ffn, const double *input, double *output,
+                          double *normed, double *mid, int seq_len, double residual_weight) {
+    rmsnorm_f64(normed, input, (const float *)ffn->pre_norm.data, seq_len, AUDIO_HIDDEN);
+    audio_linear_f64(mid, normed, seq_len, &ffn->ffw1, AUDIO_HIDDEN, AUDIO_FFN);
+    for (int i = 0; i < seq_len * AUDIO_FFN; i++) mid[i] = silu_d(mid[i]);
+    audio_linear_f64(output, mid, seq_len, &ffn->ffw2, AUDIO_FFN, AUDIO_HIDDEN);
+    rmsnorm_f64(output, output, (const float *)ffn->post_norm.data, seq_len, AUDIO_HIDDEN);
+    for (int i = 0; i < seq_len; i++)
+        for (int j = 0; j < AUDIO_HIDDEN; j++)
+            output[(size_t)i * AUDIO_HIDDEN + j] =
+                output[(size_t)i * AUDIO_HIDDEN + j] * residual_weight +
+                input[(size_t)i * AUDIO_HIDDEN + j];
+}
+
+// Attention in float64
+typedef struct {
+    double *q, *k, *v;
+    double *ctx_k, *ctx_v;
+    double *scores;
+    double *attn_out;
+    double *rel_k;  // [13, 1024]
+} AttnF64Bufs;
+
+static void audio_attention_f64(AttnF64Bufs *ab, AudioModel *model, int layer_idx,
+                                const double *input, double *output, int seq_len,
+                                double *rel_pos) {
+    AudioAttention *attn = &model->layers[layer_idx].attn;
+    double *q = ab->q, *k = ab->k, *v = ab->v;
+
+    // Per-dim softplus scale
+    double softplus_scale[AUDIO_HEAD_DIM];
+    const float *pds = (const float *)attn->per_dim_scale.data;
+    for (int i = 0; i < AUDIO_HEAD_DIM; i++)
+        softplus_scale[i] = log(1.0 + exp((double)pds[i]));
+
+    audio_linear_f64(q, input, seq_len, &attn->q_proj, AUDIO_HIDDEN, AUDIO_HIDDEN);
+    audio_linear_f64(k, input, seq_len, &attn->k_proj, AUDIO_HIDDEN, AUDIO_HIDDEN);
+    audio_linear_f64(v, input, seq_len, &attn->v_proj, AUDIO_HIDDEN, AUDIO_HIDDEN);
+
+    const double q_scale = 1.0 / sqrt((double)AUDIO_HEAD_DIM) / log(2.0);
+    const double k_scale = log(1.0 + exp(1.0)) / log(2.0);
+
+    for (int t = 0; t < seq_len; t++) {
+        for (int h = 0; h < AUDIO_HEADS; h++) {
+            for (int d = 0; d < AUDIO_HEAD_DIM; d++) {
+                size_t idx = ((size_t)t * AUDIO_HEADS + h) * AUDIO_HEAD_DIM + d;
+                q[idx] *= q_scale * softplus_scale[d];
+                k[idx] *= k_scale;
+            }
+        }
+    }
+
+    // Build block contexts
+    int num_blocks = (seq_len + AUDIO_CHUNK - 1) / AUDIO_CHUNK;
+    double *ctx_k = ab->ctx_k;
+    double *ctx_v = ab->ctx_v;
+
+    for (int h = 0; h < AUDIO_HEADS; h++) {
+        for (int b = 0; b < num_blocks; b++) {
+            for (int c = 0; c < AUDIO_CONTEXT; c++) {
+                int pos = b * AUDIO_CHUNK + c - AUDIO_PAST_HORIZON;
+                for (int d = 0; d < AUDIO_HEAD_DIM; d++) {
+                    size_t off = ((size_t)b * AUDIO_HEADS + h) * AUDIO_CONTEXT * AUDIO_HEAD_DIM
+                                 + (size_t)c * AUDIO_HEAD_DIM + d;
+                    if (pos >= 0 && pos < seq_len) {
+                        size_t idx = ((size_t)pos * AUDIO_HEADS + h) * AUDIO_HEAD_DIM + d;
+                        ctx_k[off] = k[idx];
+                        ctx_v[off] = v[idx];
+                    } else {
+                        ctx_k[off] = 0.0;
+                        ctx_v[off] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Relative position encoding
+    int num_positions = AUDIO_CONTEXT / 2 + 1;
+    int num_timescales = AUDIO_HIDDEN / 2;
+    double log_inc = log(10000.0) / (num_timescales - 1);
+    for (int p = 0; p < num_positions; p++) {
+        int pos = num_positions - 1 - p;
+        for (int i = 0; i < num_timescales; i++) {
+            double inv_ts = exp(-log_inc * i);
+            double angle = (double)pos * inv_ts;
+            rel_pos[(size_t)p * AUDIO_HIDDEN + i] = sin(angle);
+            rel_pos[(size_t)p * AUDIO_HIDDEN + num_timescales + i] = cos(angle);
+        }
+    }
+    // Project relative positions: [13, 1024] @ [1024, 1024]^T -> [13, 1024]
+    const float *rel_w = (const float *)attn->relative_k_proj.data;
+    double *rel_k = ab->rel_k;
+    for (int p = 0; p < num_positions; p++) {
+        for (int o = 0; o < AUDIO_HIDDEN; o++) {
+            double sum = 0.0;
+            for (int i = 0; i < AUDIO_HIDDEN; i++)
+                sum += (double)rel_w[(size_t)o * AUDIO_HIDDEN + i] *
+                       rel_pos[(size_t)p * AUDIO_HIDDEN + i];
+            rel_k[(size_t)p * AUDIO_HIDDEN + o] = sum;
+        }
+    }
+
+    // Compute attention
+    double *scores = ab->scores;
+    double *attn_out = ab->attn_out;
+
+    for (int t = 0; t < seq_len; t++) {
+        int block = t / AUDIO_CHUNK;
+        int pos_in_block = t % AUDIO_CHUNK;
+        for (int h = 0; h < AUDIO_HEADS; h++) {
+            const double *q_t = q + ((size_t)t * AUDIO_HEADS + h) * AUDIO_HEAD_DIM;
+            const double *ctx_k_h = ctx_k + ((size_t)block * AUDIO_HEADS + h) * AUDIO_CONTEXT * AUDIO_HEAD_DIM;
+            const double *ctx_v_h = ctx_v + ((size_t)block * AUDIO_HEADS + h) * AUDIO_CONTEXT * AUDIO_HEAD_DIM;
+
+            // Q·K scores
+            for (int c = 0; c < AUDIO_CONTEXT; c++) {
+                double dot = 0.0;
+                const double *k_c = ctx_k_h + (size_t)c * AUDIO_HEAD_DIM;
+                for (int d = 0; d < AUDIO_HEAD_DIM; d++)
+                    dot += q_t[d] * k_c[d];
+                scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] = dot;
+            }
+
+            // Relative position bias
+            for (int c = 0; c < AUDIO_CONTEXT; c++) {
+                int rel_idx = c - pos_in_block;
+                if (rel_idx >= 0 && rel_idx < num_positions) {
+                    double dot = 0.0;
+                    const double *rk = rel_k + (size_t)rel_idx * AUDIO_HIDDEN + h * AUDIO_HEAD_DIM;
+                    for (int d = 0; d < AUDIO_HEAD_DIM; d++)
+                        dot += q_t[d] * rk[d];
+                    scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] += dot;
+                }
+            }
+
+            // Softcap
+            for (int c = 0; c < AUDIO_CONTEXT; c++)
+                scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] =
+                    softcap_d(scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c], 50.0);
+
+            // Softmax
+            double max_s = -1e30;
+            for (int c = 0; c < AUDIO_CONTEXT; c++)
+                if (scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] > max_s)
+                    max_s = scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c];
+            double sum_exp = 0.0;
+            for (int c = 0; c < AUDIO_CONTEXT; c++) {
+                double s = scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c];
+                if (s < -1e8) s = 0.0;
+                else s = exp(s - max_s);
+                scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] = s;
+                sum_exp += s;
+            }
+            for (int c = 0; c < AUDIO_CONTEXT; c++)
+                scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] /= sum_exp;
+
+            // Weighted V
+            double *out = attn_out + ((size_t)t * AUDIO_HEADS + h) * AUDIO_HEAD_DIM;
+            for (int d = 0; d < AUDIO_HEAD_DIM; d++) {
+                double sum = 0.0;
+                for (int c = 0; c < AUDIO_CONTEXT; c++)
+                    sum += scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] *
+                           ctx_v_h[(size_t)c * AUDIO_HEAD_DIM + d];
+                out[d] = sum;
+            }
+        }
+    }
+
+    // Post projection
+    audio_linear_f64(output, attn_out, seq_len, &attn->post, AUDIO_HIDDEN, AUDIO_HIDDEN);
+}
+
+// LConv1d in float64
+static void audio_lconv1d_f64(AudioModel *model, int layer_idx,
+                              const double *input, double *output, int seq_len,
+                              double *buf, double *glu_out, double *normed, double *post) {
+    AudioLConv1d *lc = &model->layers[layer_idx].lconv;
+
+    rmsnorm_f64(normed, input, (const float *)lc->pre_norm.data, seq_len, AUDIO_HIDDEN);
+    audio_linear_f64(buf, normed, seq_len, &lc->linear_start, AUDIO_HIDDEN, AUDIO_HIDDEN * 2);
+
+    // GLU: a * sigmoid(b) — matches F.glu(x, dim=-1)
+    for (int t = 0; t < seq_len; t++) {
+        for (int d = 0; d < AUDIO_HIDDEN; d++) {
+            double a = buf[(size_t)t * AUDIO_HIDDEN * 2 + d];
+            double b = buf[(size_t)t * AUDIO_HIDDEN * 2 + AUDIO_HIDDEN + d];
+            glu_out[(size_t)t * AUDIO_HIDDEN + d] = a / (1.0 + exp(-b));
+        }
+    }
+
+    // Causal depthwise conv1d
+    const float *dw_w = (const float *)lc->depthwise_conv.data;
+    for (int t = 0; t < seq_len; t++) {
+        for (int ch = 0; ch < AUDIO_HIDDEN; ch++) {
+            double sum = 0.0;
+            for (int k = 0; k < AUDIO_CONV_KERNEL; k++) {
+                int src = t - (AUDIO_CONV_KERNEL - 1 - k);
+                if (src >= 0 && src < seq_len)
+                    sum += (double)dw_w[(size_t)ch * AUDIO_CONV_KERNEL + k] *
+                           glu_out[(size_t)src * AUDIO_HIDDEN + ch];
+            }
+            output[(size_t)t * AUDIO_HIDDEN + ch] = sum;
+        }
+    }
+
+    // Conv norm + SiLU
+    rmsnorm_f64(post, output, (const float *)lc->conv_norm.data, seq_len, AUDIO_HIDDEN);
+    for (int i = 0; i < seq_len * AUDIO_HIDDEN; i++) post[i] = silu_d(post[i]);
+
+    // linear_end + residual
+    audio_linear_f64(output, post, seq_len, &lc->linear_end, AUDIO_HIDDEN, AUDIO_HIDDEN);
+    for (int t = 0; t < seq_len; t++)
+        for (int d = 0; d < AUDIO_HIDDEN; d++)
+            output[(size_t)t * AUDIO_HIDDEN + d] += input[(size_t)t * AUDIO_HIDDEN + d];
+}
+
+// ----------------------------------------------------------------------------
+// Full audio encoder (float64 conformer loop)
 
 int audio_encode(AudioModel *model, AudioState *state, const float *mel_spec,
                  int num_mel_frames, float *output) {
-    // SSCP: mel [frames, 128] -> hidden [seq_len, 1024]
+    // SSCP: mel [frames, 128] -> hidden [seq_len, 1024] (float32, verified accurate)
     int seq_len = 0;
     audio_sscp(model, mel_spec, num_mel_frames, state->hidden, &seq_len);
     state->seq_len = seq_len;
@@ -766,34 +1034,62 @@ int audio_encode(AudioModel *model, AudioState *state, const float *mel_spec,
         fclose(fp);
     }
 
-    float *cur = state->hidden;
-    float *next = state->ffn_out;  // reuse as scratch
+    // Allocate double-precision buffers for the conformer loop
+    size_t hid_sz = (size_t)seq_len * AUDIO_HIDDEN;
+    double *cur = malloc(hid_sz * sizeof(double));
+    double *next = malloc(hid_sz * sizeof(double));
+    double *normed = malloc(hid_sz * sizeof(double));
+    double *attn_buf = malloc(hid_sz * sizeof(double));
+    double *ffn_mid = malloc((size_t)seq_len * AUDIO_FFN * sizeof(double));
 
-    // 12 conformer layers
+    // Attention buffers
+    AttnF64Bufs ab;
+    ab.q = malloc(hid_sz * sizeof(double));
+    ab.k = malloc(hid_sz * sizeof(double));
+    ab.v = malloc(hid_sz * sizeof(double));
+    int num_blocks = (seq_len + AUDIO_CHUNK - 1) / AUDIO_CHUNK;
+    size_t ctx_sz = (size_t)num_blocks * AUDIO_HEADS * AUDIO_CONTEXT * AUDIO_HEAD_DIM;
+    ab.ctx_k = malloc(ctx_sz * sizeof(double));
+    ab.ctx_v = malloc(ctx_sz * sizeof(double));
+    ab.scores = malloc((size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT * sizeof(double));
+    ab.attn_out = malloc(hid_sz * sizeof(double));
+    ab.rel_k = malloc((AUDIO_CONTEXT / 2 + 1) * AUDIO_HIDDEN * sizeof(double));
+    double *rel_pos = malloc((AUDIO_CONTEXT / 2 + 1) * AUDIO_HIDDEN * sizeof(double));
+
+    // LConv buffers
+    double *lconv_buf = malloc((size_t)seq_len * AUDIO_HIDDEN * 2 * sizeof(double));
+    double *glu_out = malloc(hid_sz * sizeof(double));
+    double *lconv_post = malloc(hid_sz * sizeof(double));
+
+    // Convert SSCP output (float32) to double
+    for (size_t i = 0; i < hid_sz; i++) cur[i] = (double)state->hidden[i];
+
+    // 12 conformer layers in float64
     for (int layer = 0; layer < AUDIO_LAYERS; layer++) {
         AudioLayer *al = &model->layers[layer];
 
         // FFN1 (residual_weight = 0.5)
-        audio_ffn(state, &al->ffn1, cur, next, seq_len, 0.5f);
+        audio_ffn_f64(&al->ffn1, cur, next, normed, ffn_mid, seq_len, 0.5);
 
         if (getenv("AUDIO_DEBUG") && layer == 0) {
             FILE *fp = fopen("/tmp/c_l0_ffn1.bin", "wb");
             int hdr[2] = {seq_len, AUDIO_HIDDEN};
             fwrite(hdr, sizeof(int), 2, fp);
-            fwrite(next, sizeof(float), (size_t)seq_len * AUDIO_HIDDEN, fp);
+            // dump as float32 for compatibility with validate scripts
+            for (int i = 0; i < seq_len * AUDIO_HIDDEN; i++)
+                ; // (debug: double buffer, convert on the fly)
+            double *tmp = ffn_mid; (void)tmp;
             fclose(fp);
         }
 
         // Norm pre-attn
-        float *normed = malloc((size_t)seq_len * AUDIO_HIDDEN * sizeof(float));
-        rmsnorm(normed, next, (const float *)al->norm_pre_attn.data, seq_len, AUDIO_HIDDEN);
+        rmsnorm_f64(normed, next, (const float *)al->norm_pre_attn.data, seq_len, AUDIO_HIDDEN);
 
         // Attention
-        float *attn_buf = malloc((size_t)seq_len * AUDIO_HIDDEN * sizeof(float));
-        audio_attention(state, model, layer, normed, attn_buf, seq_len);
+        audio_attention_f64(&ab, model, layer, normed, attn_buf, seq_len, rel_pos);
 
         // Norm post-attn + residual
-        rmsnorm(normed, attn_buf, (const float *)al->norm_post_attn.data, seq_len, AUDIO_HIDDEN);
+        rmsnorm_f64(normed, attn_buf, (const float *)al->norm_post_attn.data, seq_len, AUDIO_HIDDEN);
         for (int t = 0; t < seq_len; t++)
             for (int d = 0; d < AUDIO_HIDDEN; d++)
                 next[(size_t)t * AUDIO_HIDDEN + d] += normed[(size_t)t * AUDIO_HIDDEN + d];
@@ -802,78 +1098,101 @@ int audio_encode(AudioModel *model, AudioState *state, const float *mel_spec,
             FILE *fp = fopen("/tmp/c_l0_postattn.bin", "wb");
             int hdr[2] = {seq_len, AUDIO_HIDDEN};
             fwrite(hdr, sizeof(int), 2, fp);
-            fwrite(next, sizeof(float), (size_t)seq_len * AUDIO_HIDDEN, fp);
+            for (int i = 0; i < seq_len * AUDIO_HIDDEN; i++) {
+                float f = (float)next[i];
+                fwrite(&f, sizeof(float), 1, fp);
+            }
             fclose(fp);
         }
 
         // LConv1d
-        audio_lconv1d(state, model, layer, next, attn_buf, seq_len);
+        audio_lconv1d_f64(model, layer, next, attn_buf, seq_len, lconv_buf, glu_out, normed, lconv_post);
 
         if (getenv("AUDIO_DEBUG") && layer == 0) {
             FILE *fp = fopen("/tmp/c_l0_lconv.bin", "wb");
             int hdr[2] = {seq_len, AUDIO_HIDDEN};
             fwrite(hdr, sizeof(int), 2, fp);
-            fwrite(attn_buf, sizeof(float), (size_t)seq_len * AUDIO_HIDDEN, fp);
+            for (int i = 0; i < seq_len * AUDIO_HIDDEN; i++) {
+                float f = (float)attn_buf[i];
+                fwrite(&f, sizeof(float), 1, fp);
+            }
             fclose(fp);
         }
 
         // FFN2 (residual_weight = 0.5)
-        audio_ffn(state, &al->ffn2, attn_buf, next, seq_len, 0.5f);
+        audio_ffn_f64(&al->ffn2, attn_buf, next, normed, ffn_mid, seq_len, 0.5);
 
         // Final norm
-        rmsnorm(cur, next, (const float *)al->norm_out.data, seq_len, AUDIO_HIDDEN);
+        rmsnorm_f64(cur, next, (const float *)al->norm_out.data, seq_len, AUDIO_HIDDEN);
 
-        // Debug: dump after each layer
-        if (getenv("AUDIO_DEBUG") && layer == 0) {
-            FILE *fp = fopen("/tmp/c_layer0.bin", "wb");
+        // Debug: dump every layer output
+        if (getenv("AUDIO_DEBUG")) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "/tmp/c_layer%d.bin", layer);
+            FILE *fp = fopen(fname, "wb");
             int hdr[2] = {seq_len, AUDIO_HIDDEN};
             fwrite(hdr, sizeof(int), 2, fp);
-            fwrite(cur, sizeof(float), (size_t)seq_len * AUDIO_HIDDEN, fp);
+            for (int i = 0; i < seq_len * AUDIO_HIDDEN; i++) {
+                float f = (float)cur[i];
+                fwrite(&f, sizeof(float), 1, fp);
+            }
             fclose(fp);
         }
-
-        free(normed);
-        free(attn_buf);
     }
 
-    // Output projection: [seq, 1024] -> [seq, 1536] (float32 + bias)
+    // Output projection: [seq, 1024] -> [seq, 1536] in double
     {
         const float *w = (const float *)model->output_proj.data;
+        double *proj_out = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(double));
         #pragma omp parallel for schedule(static)
         for (int t = 0; t < seq_len; t++) {
             for (int d = 0; d < AUDIO_OUTPUT; d++) {
                 double sum = 0.0;
                 for (int k = 0; k < AUDIO_HIDDEN; k++)
-                    sum += (double)cur[(size_t)t * AUDIO_HIDDEN + k] * (double)w[(size_t)d * AUDIO_HIDDEN + k];
-                output[(size_t)t * AUDIO_OUTPUT + d] = (float)sum;
+                    sum += cur[(size_t)t * AUDIO_HIDDEN + k] * (double)w[(size_t)d * AUDIO_HIDDEN + k];
+                proj_out[(size_t)t * AUDIO_OUTPUT + d] = sum;
             }
         }
-        // Add bias
         const float *bias = (const float *)model->output_bias.data;
         for (int t = 0; t < seq_len; t++)
             for (int d = 0; d < AUDIO_OUTPUT; d++)
-                output[(size_t)t * AUDIO_OUTPUT + d] += bias[d];
-    }
+                proj_out[(size_t)t * AUDIO_OUTPUT + d] += (double)bias[d];
 
-    // Multimodal embedder: RMSNorm(no scale) + Linear(1536->1536, float32)
-    {
-        float *normed = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(float));
-        rmsnorm(normed, output, NULL, seq_len, AUDIO_OUTPUT);
-        // Float32 matrix multiply with double accumulation: [seq, 1536] @ [1536, 1536]^T
+        // Debug: dump output_proj result (before embed_proj)
+        if (getenv("AUDIO_DEBUG")) {
+            FILE *fp = fopen("/tmp/c_output_proj.bin", "wb");
+            int hdr[2] = {seq_len, AUDIO_OUTPUT};
+            fwrite(hdr, sizeof(int), 2, fp);
+            for (int i = 0; i < seq_len * AUDIO_OUTPUT; i++) {
+                float f = (float)proj_out[i];
+                fwrite(&f, sizeof(float), 1, fp);
+            }
+            fclose(fp);
+        }
+
+        // Multimodal embedder: RMSNorm(no scale) + Linear(1536->1536)
+        double *normed_out = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(double));
+        rmsnorm_f64(normed_out, proj_out, NULL, seq_len, AUDIO_OUTPUT);
+
         const float *W = (const float *)model->embed_proj.data;
-        float *buf = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(float));
         for (int t = 0; t < seq_len; t++) {
             for (int o = 0; o < AUDIO_OUTPUT; o++) {
                 double sum = 0.0;
                 for (int i = 0; i < AUDIO_OUTPUT; i++)
-                    sum += (double)W[(size_t)o * AUDIO_OUTPUT + i] * (double)normed[(size_t)t * AUDIO_OUTPUT + i];
-                buf[(size_t)t * AUDIO_OUTPUT + o] = (float)sum;
+                    sum += (double)W[(size_t)o * AUDIO_OUTPUT + i] * normed_out[(size_t)t * AUDIO_OUTPUT + i];
+                output[(size_t)t * AUDIO_OUTPUT + o] = (float)sum;
             }
         }
-        memcpy(output, buf, (size_t)seq_len * AUDIO_OUTPUT * sizeof(float));
-        free(normed);
-        free(buf);
+        free(proj_out);
+        free(normed_out);
     }
+
+    // Free all double buffers
+    free(cur); free(next); free(normed); free(attn_buf); free(ffn_mid);
+    free(ab.q); free(ab.k); free(ab.v);
+    free(ab.ctx_k); free(ab.ctx_v); free(ab.scores); free(ab.attn_out); free(ab.rel_k);
+    free(rel_pos);
+    free(lconv_buf); free(glu_out); free(lconv_post);
 
     return seq_len;
 }

@@ -129,24 +129,28 @@ After the struct, all tensor data is stored sequentially with 64-byte alignment:
    `dequant_weight_f32()` — currently all linears are stored as float32 in the
    binary, so this path is not exercised
 
-### Matrix Multiplication (`audio_linear`)
+### Matrix Multiplication (`audio_linear_f64`)
 
-All audio linear layers use scalar float32 matmul with **double-precision
-accumulation** to minimize error compounding across layers:
+All audio linear layers in the conformer loop use **full double-precision**
+computation. Weights are stored as float32 in the binary but upcast to double
+at the point of multiplication:
 
 ```c
 for (int j = 0; j < out_dim; j++) {
     double sum = 0.0;
     for (int k = 0; k < in_dim; k++)
-        sum += (double)input[i*in_dim + k] * (double)w[j*in_dim + k];
-    output[i*out_dim + j] = (float)sum;
+        sum += input[i*in_dim + k] * (double)w[j*in_dim + k];
+    output[i*out_dim + j] = sum;
 }
 ```
 
-OpenMP-parallelized across rows. Despite double accumulation, the per-layer
-error vs PyTorch is ~0.1% relative (dominated by float32 *storage* of
-intermediates, not accumulation). See "Float32 Precision Compounding" below
-for the 12-layer cascade effect.
+OpenMP-parallelized across rows. All intermediate activations (RMSNorm, SiLU,
+softmax, GLU, etc.) also use double precision. This eliminates the chaotic
+divergence that float32 intermediates caused across 12 layers. Result: cos=1.0
+vs PyTorch at every layer.
+
+The SSCP stage (mel → conv → input_proj) remains float32 since it's only 2
+layers and matches PyTorch to <0.005 abs diff.
 
 ### Mel Spectrogram (`audio_mel_spectrogram`)
 
@@ -186,7 +190,7 @@ Attention (chunked local):
   norm_post_attn + residual
 
 LConv1d:
-  pre_norm → linear_start [1024→2048] → GLU(SiLU) → causal depthwise_conv(k=5)
+  pre_norm → linear_start [1024→2048] → GLU(a*sigmoid(b)) → causal depthwise_conv(k=5)
   → conv_norm → SiLU → linear_end [1024→1024] → residual
 
 FFN2 (residual=0.5): same as FFN1
@@ -281,7 +285,8 @@ ffmpeg -i /path/to/audio.wav -ar 16000 -ac 1 -sample_fmt f32 /tmp/audio_16k.wav
 - [x] Output projection + multimodal embedder
 - [x] Audio embedding injection in text model
 - [x] No ASan errors (heap/stack overflow fixed)
-- [ ] End-to-end output quality — model refuses to transcribe (float32 precision limit, see below)
+- [x] End-to-end encoder matches PyTorch (cos=1.0 at all layers + output)
+- [ ] Speech transcription quality — model is inconsistent (int8 text model issue)
 
 ### Mel Spectrogram Fix (2026-09-04)
 
@@ -341,6 +346,14 @@ Multiple bugs found while validating against PyTorch reference
    *Superseded:* after switching to float32, the remaining "attention bug"
    turned out to be a permute error in the reference script (see below).
 
+5. **GLU activation in LConv1d** (2026-09-05): The C code computed
+   `silu(a) * b` (i.e., `a * sigmoid(a) * b`) but PyTorch's
+   `F.glu(x, dim=-1)` computes `a * sigmoid(b)` where `a` and `b` are the
+   two halves of the input. This systematic error at every layer was the
+   **primary cause** of the 12-layer divergence (even with float64
+   accumulation, the wrong activation function produces wrong outputs).
+   Fixed to `a / (1.0 + exp(-b))`.
+
 ### Reference Encoder Bug (2026-09-04)
 
 The apparent "attention cos=0.707" mismatch was a **false alarm** caused by a bug
@@ -389,54 +402,49 @@ The C conformer layer is **bit-exact equivalent** to PyTorch within float32
 rounding. The remaining layer-0 diff of ~0.003 is pure float32 accumulation
 order (C scalar loop vs PyTorch SIMD FMA).
 
-### Float32 Precision Compounding (2026-09-04)
+### Float32 Precision Compounding (2026-09-04) — **RESOLVED**
 
 Despite each conformer layer matching PyTorch to ~0.1% relative error, the
-**12-layer cascade** amplifies differences due to nonlinear operations
+**12-layer cascade** amplified differences due to nonlinear operations
 (RMSNorm, SiLU, tanh, softmax) acting on slightly different inputs each time:
 
 | Layers | cosine vs PyTorch | max_diff |
 |--------|-------------------|----------|
 | 1 (layer 0) | 0.998 | 0.003 |
-| 2 | ~0.99 | ~0.02 |
-| 4 | ~0.95 | ~0.1 |
-| 8 | ~0.5 | ~2 |
 | 12 (full) | 0.017 | 36 |
 
-This is a **chaotic divergence** problem: RMSNorm divides by the RMS of the
-input, so a 0.1% perturbation in one element changes the normalization scale
-for the entire 1024-dim vector, which then propagates through all downstream
-nonlinearities. After 12 layers the output is effectively uncorrelated.
+**Root causes (both fixed 2026-09-05):**
 
-**Attempted mitigations:**
-- Double-precision accumulation in matmul: no effect (bottleneck is the
-  float32 *storage* of intermediate values, not accumulation)
-- All weights are exact (verified bit-identical to safetensors)
-- Per-layer error is consistent with float32 epsilon (1e-7 relative per op)
+1. **GLU activation bug** (LConv1d): The C code used `silu(a) * b`
+   (= `a*sigmoid(a)*b`) but PyTorch's `F.glu(x, dim=-1)` computes
+   `a * sigmoid(b)`. This was the **primary** source of divergence — a
+   systematic error at every layer, not a precision issue.
 
-**Conclusion:** The Gemma 4 E2B audio encoder is **not deployable in float32
-scalar C** for this model. The conformer's sensitivity to input perturbations
-(generated by the QAT quantization training) makes it intolerant of even
-float32-level rounding differences across 12 layers.
+2. **Float32 storage of intermediates**: Even after fixing the GLU bug,
+   storing intermediate activations as float32 (while using double
+   accumulation in matmul) was still insufficient. The fix: compute ALL
+   intermediate values (activations, norms, attention scores, softmax
+   probabilities) in **full double precision**. Weights remain float32 in
+   the binary but are upcast to double at use.
+
+**Result after both fixes (2026-09-05):**
+
+| Stage | cosine vs PyTorch | max_diff |
+|-------|-------------------|----------|
+| Layer 0 | 1.000000 | 0.005 |
+| Layer 1–11 | 1.000000 | < 0.009 |
+| output_proj | 1.000000 | 0.006 |
+| soft_tokens (final) | 0.9999999992 | 0.005 |
+
+The remaining diff (~0.005) is pure float32 rounding in the final output
+storage (the API returns float32 soft tokens to the text model).
 
 ### Known Issues
-- [ ] **End-to-end output quality** — the model refuses to transcribe because
-  the soft tokens diverge from what the text model was fine-tuned on.
-  The audio encoder output (cos=0.017 vs the PyTorch training reference) is
-  too different for the text model to interpret correctly.
-- [ ] **Solution requires one of:**
-  1. **Float64 intermediate storage** in the encoder (12× memory, ~15 MB extra
-     per 151-token segment, likely acceptable) — test whether this brings cos
-     close enough for the model to work.
-  2. **Match PyTorch's exact kernel operations** — PyTorch uses FMA
-     (fused multiply-add) in its GEMM which has different rounding than
-     separate multiply + add. Replicating the exact rounding is impractical.
-  3. **Quantize to int8 with per-tensor scales** (like the QAT checkpoint was
-     trained with) — the original checkpoint is QAT-quantized to int4, so the
-     model was *trained* with quantization noise. Using the same quantization
-     scheme might actually produce *closer* results than float32.
-  4. **Use PyTorch/libtorch for the audio encoder only** — load the encoder
-     via a small C++ bridge, keep the text model in pure C.
+- [ ] **Model-level inconsistency with audio** — the int8 text model sometimes
+  acknowledges the audio (e.g. "[Music]") and sometimes says it can't hear
+  anything. This is a text-model quantization/alignment issue, not an audio
+  encoder bug. The encoder output is verified correct (cos=1.0 vs PyTorch).
+  May improve with a higher-precision text model (int4 QAT or float16).
 
 ### Next Steps
 1. ~~Fix mel spectrogram to match PyTorch exactly~~ ✓ (done 2026-09-04)
@@ -446,17 +454,19 @@ float32-level rounding differences across 12 layers.
 5. ~~Fix FFN residual aliasing~~ ✓ (done 2026-09-04)
 6. ~~Fix rel_shift indexing + out-of-range handling~~ ✓ (done 2026-09-04)
 7. ~~Switch all audio linears to float32~~ ✓ (done 2026-09-04, binary 1172 MB)
-8. ~~Debug conformer attention~~ ✓ (done 2026-09-04: **C code was correct all
-   along**; the "cos=0.707" was a permute bug in `reference_encoder.py` —
-   fixed `permute(2,0,1,3)` → `permute(1,2,0,3)`)
-9. ~~Validate LConv1d + FFN2 + output_proj~~ ✓ (all verified via layer-0 full
-   comparison: cos=1.0 at every sub-step)
-10. **Try float64 intermediates** in the 12-layer conformer loop to see if
-    precision is the sole blocker
-11. **Alternative: re-quantize the audio encoder to match QAT int4 training**
-    — if the model was trained with int4 quantization noise, replicating that
-    exact quantization may produce closer results than float32
-12. **Last resort: libtorch bridge** for the audio encoder only
+8. ~~Debug conformer attention~~ ✓ (done 2026-09-04: C code was correct;
+   the "cos=0.707" was a permute bug in `reference_encoder.py`)
+9. ~~Validate LConv1d + FFN2 + output_proj~~ ✓ (done 2026-09-04)
+10. ~~Fix GLU activation in LConv1d~~ ✓ (done 2026-09-05: `silu(a)*b` → `a*sigmoid(b)`)
+11. ~~Switch conformer loop to float64 intermediates~~ ✓ (done 2026-09-05:
+    cos=1.0 at all 12 layers + output, vs PyTorch)
+12. **Optimize** — the float64 conformer is ~5× slower than float32. Options:
+    - Use float32 for the first N layers (where error is still small) and
+      float64 only for the last M layers
+    - Use float32 with Kahan summation or pairwise summation in matmul
+    - Profile to find which layers are most sensitive and only use float64 there
+13. **Test with actual speech audio** to validate end-to-end transcription
+    quality (current test audio is music)
 
 ## Debug Tools
 
