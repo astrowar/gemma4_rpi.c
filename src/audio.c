@@ -292,15 +292,15 @@ static inline float clampf(float x, float lo, float hi) {
 
 static void audio_linear(float *output, const float *input, int rows,
                          const ClippableLinear *layer, int in_dim, int out_dim) {
-    // Float32 matmul: output[rows, out_dim] = input[rows, in_dim] @ weight[out_dim, in_dim]^T
+    // Float32 matmul with double accumulation: output[rows, out_dim] = input[rows, in_dim] @ weight[out_dim, in_dim]^T
     const float *w = (const float *)layer->weight.data;
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < out_dim; j++) {
-            float sum = 0.0f;
+            double sum = 0.0;
             for (int k = 0; k < in_dim; k++)
-                sum += input[(size_t)i * in_dim + k] * w[(size_t)j * in_dim + k];
-            output[(size_t)i * out_dim + j] = sum;
+                sum += (double)input[(size_t)i * in_dim + k] * (double)w[(size_t)j * in_dim + k];
+            output[(size_t)i * out_dim + j] = (float)sum;
         }
     }
 }
@@ -555,6 +555,11 @@ static void audio_attention(AudioState *state, AudioModel *model, int layer_idx,
     float *scores = state->attn_scores;  // [seq, heads, context]
     float *attn_out = state->attn_out;   // [seq, heads, dim]
 
+    // Debug buffers for layer 0
+    int dbg = getenv("AUDIO_DEBUG") && layer_idx == 0;
+    float *dbg_ac = dbg ? malloc((size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT * sizeof(float)) : NULL;
+    float *dbg_pre_cap = dbg ? malloc((size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT * sizeof(float)) : NULL;
+
     for (int t = 0; t < seq_len; t++) {
         int block = t / AUDIO_CHUNK;
         int pos_in_block = t % AUDIO_CHUNK;
@@ -572,6 +577,11 @@ static void audio_attention(AudioState *state, AudioModel *model, int layer_idx,
                 scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] = dot;
             }
 
+            if (dbg)
+                memcpy(dbg_ac + ((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT,
+                       scores + ((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT,
+                       AUDIO_CONTEXT * sizeof(float));
+
             // matrix_bd: relative position contribution (zero for out-of-range)
             // rel_shift: position p in block, context c → rel_k index = c - p
             for (int c = 0; c < AUDIO_CONTEXT; c++) {
@@ -584,6 +594,11 @@ static void audio_attention(AudioState *state, AudioModel *model, int layer_idx,
                     scores[((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT + c] += dot;
                 }
             }
+
+            if (dbg)
+                memcpy(dbg_pre_cap + ((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT,
+                       scores + ((size_t)t * AUDIO_HEADS + h) * AUDIO_CONTEXT,
+                       AUDIO_CONTEXT * sizeof(float));
 
             // Soft cap
             for (int c = 0; c < AUDIO_CONTEXT; c++)
@@ -616,6 +631,61 @@ static void audio_attention(AudioState *state, AudioModel *model, int layer_idx,
                 out[d] = sum;
             }
         }
+    }
+
+    // Debug dumps for attention sub-steps (layer 0 only)
+    if (dbg) {
+        {
+            FILE *fp = fopen("/tmp/c_attn_matrix_ac.bin", "wb");
+            int hdr[2] = {seq_len, AUDIO_HEADS * AUDIO_CONTEXT};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(dbg_ac, sizeof(float), (size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_pre_cap.bin", "wb");
+            int hdr[2] = {seq_len, AUDIO_HEADS * AUDIO_CONTEXT};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(dbg_pre_cap, sizeof(float), (size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_weights.bin", "wb");
+            int hdr[2] = {seq_len, AUDIO_HEADS * AUDIO_CONTEXT};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(scores, sizeof(float), (size_t)seq_len * AUDIO_HEADS * AUDIO_CONTEXT, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_rel_k.bin", "wb");
+            int hdr[2] = {num_positions, AUDIO_HIDDEN};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(state->rel_k, sizeof(float), (size_t)num_positions * AUDIO_HIDDEN, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_ctx_k_b0.bin", "wb");
+            int hdr[2] = {AUDIO_HEADS * AUDIO_CONTEXT, AUDIO_HEAD_DIM};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(ctx_k, sizeof(float), (size_t)AUDIO_HEADS * AUDIO_CONTEXT * AUDIO_HEAD_DIM, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_prepost.bin", "wb");
+            int hdr[2] = {seq_len, AUDIO_HIDDEN};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(attn_out, sizeof(float), (size_t)seq_len * AUDIO_HIDDEN, fp);
+            fclose(fp);
+        }
+        {
+            FILE *fp = fopen("/tmp/c_attn_ctx_v_b0.bin", "wb");
+            int hdr[2] = {AUDIO_HEADS * AUDIO_CONTEXT, AUDIO_HEAD_DIM};
+            fwrite(hdr, sizeof(int), 2, fp);
+            fwrite(ctx_v, sizeof(float), (size_t)AUDIO_HEADS * AUDIO_CONTEXT * AUDIO_HEAD_DIM, fp);
+            fclose(fp);
+        }
+        free(dbg_ac);
+        free(dbg_pre_cap);
     }
 
     // Reshape back to [seq, hidden] and apply post projection
@@ -772,10 +842,10 @@ int audio_encode(AudioModel *model, AudioState *state, const float *mel_spec,
         #pragma omp parallel for schedule(static)
         for (int t = 0; t < seq_len; t++) {
             for (int d = 0; d < AUDIO_OUTPUT; d++) {
-                float sum = 0.0f;
+                double sum = 0.0;
                 for (int k = 0; k < AUDIO_HIDDEN; k++)
-                    sum += cur[(size_t)t * AUDIO_HIDDEN + k] * w[(size_t)d * AUDIO_HIDDEN + k];
-                output[(size_t)t * AUDIO_OUTPUT + d] = sum;
+                    sum += (double)cur[(size_t)t * AUDIO_HIDDEN + k] * (double)w[(size_t)d * AUDIO_HIDDEN + k];
+                output[(size_t)t * AUDIO_OUTPUT + d] = (float)sum;
             }
         }
         // Add bias
@@ -789,15 +859,15 @@ int audio_encode(AudioModel *model, AudioState *state, const float *mel_spec,
     {
         float *normed = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(float));
         rmsnorm(normed, output, NULL, seq_len, AUDIO_OUTPUT);
-        // Float32 matrix multiply: [seq, 1536] @ [1536, 1536]^T
+        // Float32 matrix multiply with double accumulation: [seq, 1536] @ [1536, 1536]^T
         const float *W = (const float *)model->embed_proj.data;
         float *buf = malloc((size_t)seq_len * AUDIO_OUTPUT * sizeof(float));
         for (int t = 0; t < seq_len; t++) {
             for (int o = 0; o < AUDIO_OUTPUT; o++) {
-                float sum = 0.0f;
+                double sum = 0.0;
                 for (int i = 0; i < AUDIO_OUTPUT; i++)
-                    sum += W[(size_t)o * AUDIO_OUTPUT + i] * normed[(size_t)t * AUDIO_OUTPUT + i];
-                buf[(size_t)t * AUDIO_OUTPUT + o] = sum;
+                    sum += (double)W[(size_t)o * AUDIO_OUTPUT + i] * (double)normed[(size_t)t * AUDIO_OUTPUT + i];
+                buf[(size_t)t * AUDIO_OUTPUT + o] = (float)sum;
             }
         }
         memcpy(output, buf, (size_t)seq_len * AUDIO_OUTPUT * sizeof(float));

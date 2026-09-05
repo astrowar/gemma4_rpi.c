@@ -144,8 +144,8 @@ def audio_attention(hs, wq, wk, wv, wpost, wrel, per_dim_scale, pos_embed):
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
     attn_out = attn_weights @ v_5d  # [1, H, nb, C, CTX] @ [1, H, nb, CTX, D] → [1, H, nb, C, D]
 
-    # Reshape back: [1, H, nb, C, D] → [nb, C, H, D] → [nb*C, H*D]
-    attn_out = attn_out.squeeze(0).permute(2, 0, 1, 3).reshape(num_blocks * CHUNK, -1)
+    # Reshape back: [H, nb, C, D] → permute → [nb, C, H, D] → [nb*C, H*D]
+    attn_out = attn_out.squeeze(0).permute(1, 2, 0, 3).reshape(num_blocks * CHUNK, -1)
     attn_out = attn_out[:T].contiguous()
 
     # Post projection
